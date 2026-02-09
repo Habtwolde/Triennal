@@ -31,8 +31,8 @@ except Exception:
 # =============================
 st.set_page_config(page_title="Triennial Report Generator", layout="wide")
 st.title("Triennial Report Generator")
-st.caption("Select inputs, then filter by Field and Activity Type to generate a publication-ready DOCX report.")
-st.write("APP VERSION: 2025-12-30 v13")
+st.caption("Select inputs, then filter by Field to generate a publication-ready DOCX report.")
+st.write("APP VERSION: 2025-12-30 v13 (Activity Type filter removed)")
 
 
 # =============================
@@ -43,6 +43,17 @@ SHOW_PARTIAL_OUTPUT = False
 SILENT_STAGING = True
 
 
+
+# =============================
+# Acronym handling
+# =============================
+DISABLE_ACRONYM_EXPANSION = True  # Client requirement: do NOT expand acronyms in narrative text
+PROTECTED_ACRONYMS = {"CI", "CIs", "C.I.", "C.I.s", "C.I.s.", "C.I", "CI.", "CIs."}
+
+NO_ACRONYM_EXPANSION_INSTRUCTION = (
+    "Do NOT expand acronyms in the narrative text. Keep acronyms exactly as written in the source. "
+    "Never expand CI or CIs."
+)
 # =============================
 # 1) Default paths & constants
 # =============================
@@ -89,7 +100,7 @@ SUMMARY_RETRY_LIMIT = 4
 
 
 FIELD_COL = "Field"
-ACTIVITY_TYPE_COL = "Activity Type"
+# ACTIVITY_TYPE_COL removed per client requirement (no Activity Type filtering)
 
 CANON = [
     "Submitting ICO", "Lead ICO", "Unique ID", "Collaborating ICOs/Agencies/Orgs",
@@ -352,14 +363,13 @@ def _trim_to_last_complete_sentence(paragraph: str) -> str:
         return p
 
     # Try to trim to the last sentence-ending punctuation.
-    # We search for the last occurrence of '.', '!' or '?' that is not too early.
     last = max(p.rfind("."), p.rfind("!"), p.rfind("?"))
     if last >= 0 and last >= int(len(p) * 0.60):
         p = p[: last + 1].strip()
         if _END_PUNCT_RE.search(p):
             return p
 
-    # Fallback: add a period (least preferred, but prevents hanging fragments)
+    # Fallback: add a period
     return p.rstrip(";,:-") + "."
 
 def finalize_multparagraph_text(md_text: str) -> str:
@@ -414,11 +424,6 @@ def strip_raw_uid_tokens(text: str) -> str:
     Critical: DO NOT strip the UID inside Pandoc footnote markers like [^378_NIAID].
     If we remove the UID from inside the marker, the text becomes '[^]' and Pandoc
     will no longer convert it into a footnote/citation (it will remain literal in the DOCX).
-
-    Approach:
-      1) Temporarily protect any [^UID] markers
-      2) Strip standalone UID tokens from the remaining prose
-      3) Restore the protected markers
     """
     if not text:
         return text
@@ -448,7 +453,6 @@ def strip_raw_uid_tokens(text: str) -> str:
     return restored.strip()
 
 
-
 def inject_entry_labels_near_uid_markers(text: str, uid_to_entry: dict[str, int]) -> str:
     """
     Replace each UID marker [^UID] with '(Entry n)[^UID]' so reviewers can trace each citation
@@ -474,24 +478,19 @@ def inject_entry_labels_near_uid_markers(text: str, uid_to_entry: dict[str, int]
 
         return f"(Entry {n})" + m.group(0)
 
-    # We must run substitution on a stable snapshot; use finditer indices on original text is tricky,
-    # so we do a single pass with re.sub and a function; it will be fine because _repl references outer text.
     return UID_MARK_RE.sub(_repl, text)
 
 def nih_style_citation_phrasing(text: str) -> str:
     """
     Strict NIH narrative citation style:
-      - No lead-in/meta prose that explains citations (e.g., 'as evidenced by', 'marked by', 'such as', 'illustrated by').
-      - Narrative should stand alone; citations appear only as '(Entry n)[^UID]' appended to the relevant claim.
-      - Multiple citations are separated by COMMAS (not 'and').
-      - Fixes punctuation artifacts (e.g., 'and,(Entry n)', '.,(Entry n)').
+      - No lead-in/meta prose that explains citations.
+      - Multiple citations separated by COMMAS.
     """
     if not text:
         return text
 
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Remove lead-in prose ONLY when it directly precedes a citation token or raw UID marker.
     leadins = [
         r"as\s+evidenced\s+by",
         r"evidenced\s+by",
@@ -530,27 +529,21 @@ def nih_style_citation_phrasing(text: str) -> str:
         text = re.sub(rf"\b{li}\b\s*(?=\(Entry\s+\d+\)\[\^)", "", text, flags=re.IGNORECASE)
         text = re.sub(rf"\b{li}\b\s*(?=\[\^)", "", text, flags=re.IGNORECASE)
 
-    # Remove dangling conjunctions and stray commas before a citation
     text = re.sub(r"\b(and|or)\s*,?\s*(?=\(Entry\s+\d+\)\[\^)", "", text, flags=re.IGNORECASE)
     text = re.sub(r",\s*(?=\(Entry\s+\d+\)\[\^)", "", text)
 
-    # Fix stray punctuation directly before a citation
     text = re.sub(r"\s*,\s*(?=\(Entry\s+\d+\)\[\^)", " ", text)
     text = re.sub(r"\.(?=\(Entry\s+\d+\)\[\^)", "", text)
 
-    # Normalize sequences of citations separated by commas/spaces into comma-separated list
     cite_token = r"\(Entry\s+\d+\)\[\^[A-Za-z0-9._-]+\]"
-    # Match consecutive citations separated by optional commas/spaces
     seq_re = re.compile(rf"({cite_token})(?:\s*,?\s*({cite_token}))+")
 
     def _format_seq(m: re.Match) -> str:
         tokens = re.findall(cite_token, m.group(0))
-        # Always join with comma+space
         return ", ".join(tokens)
 
     text = seq_re.sub(_format_seq, text)
 
-    # Clean spacing around punctuation
     text = re.sub(r"\s+([\.,;:!?])", r"\1", text)
     text = re.sub(r"\(\s+", "(", text)
     text = re.sub(r"\s+\)", ")", text)
@@ -560,22 +553,16 @@ def nih_style_citation_phrasing(text: str) -> str:
 def ensure_period_after_citations(text: str) -> str:
     """
     Ensure sentence-ending period appears AFTER citation blocks.
-    Converts:
-        'text. (Entry 1)[^A], (Entry 2)[^B]'
-    to:
-        'text (Entry 1)[^A], (Entry 2)[^B].'
     """
     if not text:
         return text
 
-    # Move period that appears before a citation block to after the last citation
     text = re.sub(
         r"\.\s*((?:\((?:Entry\s+\d+)\)\[\^[^\]]+\](?:,\s*)?)+)",
         r" \1.",
         text
     )
 
-    # If a citation block ends a sentence with no punctuation, add period
     text = re.sub(
         r"((?:\((?:Entry\s+\d+)\)\[\^[^\]]+\](?:,\s*)?)+)(?=\s*$)",
         r"\1.",
@@ -588,26 +575,15 @@ def ensure_period_after_citations(text: str) -> str:
 def ensure_semicolon_after_entry_citation(text: str) -> str:
     """
     Ensure a grammatical boundary after Entry citations when a new sentence/clause starts.
-
-    Enforces the requested formatting:
-        '(Entry 1)[^UID] Next sentence...'
-    becomes:
-        '(Entry 1)[^UID]; Next sentence...'
-
-    Applies to both:
-      - (Entry n)[^uid]
-      - (Entry n)
     """
     if not text:
         return text
 
-    # With UID marker
     text = re.sub(
         r"(\(Entry\s+\d+\)\[\^[^\]]+\])\s+(?=[A-Z])",
         r"\1; ",
         text
     )
-    # Without UID marker
     text = re.sub(
         r"(\(Entry\s+\d+\))\s+(?=[A-Z])",
         r"\1; ",
@@ -619,21 +595,14 @@ def ensure_semicolon_after_entry_citation(text: str) -> str:
 def replace_percent_sign(text: str) -> str:
     """
     Convert percent signs to the word 'percent' per client requirement.
-    Examples:
-      '10%' -> '10 percent'
-      '10 %' -> '10 percent'
-      '12.5%' -> '12.5 percent'
     """
     if not text:
         return text
-    # Avoid touching URLs (rare in narrative, but safe)
     parts = re.split(r"(https?://\S+)", text)
     for i, p in enumerate(parts):
         if p.startswith("http://") or p.startswith("https://"):
             continue
-        # Replace any numeric percentage token with 'percent'
         p = re.sub(r"(\d+(?:\.\d+)?)\s*%", r"\1 percent", p)
-        # Safety: remove any remaining percent signs (client forbids '%')
         if "%" in p:
             p = p.replace("%", " percent")
         parts[i] = p
@@ -661,40 +630,33 @@ _ICO_FULLNAME_TO_ACR = {
 }
 
 
+def revert_ci_expansions(text: str) -> str:
+    """Revert accidental expansions of CI/CIs back to the acronyms in narrative text."""
+    if not text:
+        return text
+    # Common variants; keep this intentionally narrow to avoid unintended edits.
+    text = re.sub(r"\bconfidence intervals\b", "CIs", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bconfidence interval\b", "CI", text, flags=re.IGNORECASE)
+    return text
+
+
 def enforce_ico_acronyms(text: str) -> str:
     """
     Enforce client rule: NIH ICOs must appear as acronyms in narrative paragraphs.
-    Replaces full institute names (optionally followed by '(ACR)') with the acronym only.
-    Also removes leading articles such as "the NCI" -> "NCI" to comply with house style.
     """
     if not text:
         return text
 
     for full, acr in _ICO_FULLNAME_TO_ACR.items():
-        # Replace "Full Name (ACR)" with "ACR"
         text = re.sub(
             rf"\b{re.escape(full)}\s*\(\s*{re.escape(acr)}\s*\)",
             acr,
             text,
         )
-        # Replace bare full name with acronym
         text = re.sub(rf"\b{re.escape(full)}\b", acr, text)
 
-    # Remove leading "the" before common NIH acronyms (house style)
     acr_pat = "|".join(sorted({v for v in _ICO_FULLNAME_TO_ACR.values()} | {"NIH"}))
     text = re.sub(rf"\bthe\s+({acr_pat})\b", r"\1", text, flags=re.IGNORECASE)
-
-    return text
-
-    for full, acr in _ICO_FULLNAME_TO_ACR.items():
-        # Replace "Full Name (ACR)" or "Full Name (acr)" with "ACR"
-        text = re.sub(
-            rf"\b{re.escape(full)}\s*\(\s*{re.escape(acr)}\s*\)",
-            acr,
-            text,
-        )
-        # Replace bare full name with acronym
-        text = re.sub(rf"\b{re.escape(full)}\b", acr, text)
 
     return text
 
@@ -702,7 +664,6 @@ def enforce_ico_acronyms(text: str) -> str:
 def postprocess_narrative(text: str) -> str:
     """
     Centralized deterministic cleanup applied AFTER LLM output and BEFORE DOCX rendering.
-    Order matters: enforce acronyms, normalize percent, then citation boundaries.
     """
     if not text:
         return text
@@ -710,60 +671,38 @@ def postprocess_narrative(text: str) -> str:
     text = replace_percent_sign(text)
     text = ensure_semicolon_after_entry_citation(text)
     return text
+
 def compact_consecutive_citations(t: str) -> str:
     """
-    Make citation markers 'silent' and compact:
-      - Remove conjunctions between markers: [^A] and [^B] -> [^A][^B]
-      - Remove commas between markers: [^A], [^B] -> [^A][^B]
-      - Remove stray filler like 'and,' or ', and' immediately around markers
+    Make citation markers 'silent' and compact.
     """
     if not t:
         return t
 
-    # Normalize spacing first
     t = re.sub(r"\s+", " ", t).strip()
-
-    # [^A] , [^B]  -> [^A][^B]
     t = re.sub(r"(\[\^\s*[A-Za-z0-9._-]+\s*\])\s*,\s*(\[\^\s*[A-Za-z0-9._-]+\s*\])", r"\1\2", t)
-
-    # [^A] and [^B] -> [^A][^B]
     t = re.sub(
         r"(\[\^\s*[A-Za-z0-9._-]+\s*\])\s*(?:,?\s*(?:and|or)\s+)\s*(\[\^\s*[A-Za-z0-9._-]+\s*\])",
         r"\1\2",
         t,
         flags=re.IGNORECASE
     )
-
-    # Clean any leftover ", and" before a marker
     t = re.sub(r",\s*(?=\[\^)", " ", t)
     t = re.sub(r"\b(and|or)\s+(?=\[\^)", "", t, flags=re.IGNORECASE)
-
-    # Final spacing cleanup
     t = re.sub(r"\s+([,.;:!?])", r"\1", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
 def enforce_intro_summary_rules(text: str) -> str:
-    """Hard rules for Introduction and Summary.
-
-    Enforces:
-      - No '(Entry n)' labels (or 'Entry n') in these sections.
-      - No citation lead-ins (e.g., 'marked by', 'as evident in', 'for instance').
-      - Citations must be silent via [^UID] markers only.
-      - Citation markers should be sentence-terminal where possible.
-      - Do not connect citation markers with 'and/or' (stack markers instead).
-    """
+    """Hard rules for Introduction and Summary."""
     if not text:
         return text
 
     t = str(text)
 
-    # Remove any explicit Entry labels
     t = re.sub(r"\(\s*Entry\s+\d+\s*\)", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\bEntry\s+\d+\b", "", t, flags=re.IGNORECASE)
 
-    # Remove common citation lead-in scaffolding (even if not immediately adjacent)
-    # This targets exactly the junk you showed: "as evident in activities marked by ..."
     scaffold_patterns = [
         r"\bas\s+evidenced\s+by\b",
         r"\bas\s+evident\s+in\b",
@@ -783,8 +722,6 @@ def enforce_intro_summary_rules(text: str) -> str:
         r"\bthe\s+above\s+activities?\b",
     ]
 
-    # Remove "For instance," / "For example," ONLY when it is used to introduce citations
-    # (i.e., a marker occurs shortly after)
     t = re.sub(
         r"\b(For\s+instance|For\s+example)\b\s*,?\s*(?=(?:.{0,60}\[\^))",
         "",
@@ -792,29 +729,21 @@ def enforce_intro_summary_rules(text: str) -> str:
         flags=re.IGNORECASE
     )
 
-    # Remove “such as … [^UID]” type intros when they are just scaffolding
     t = re.sub(r"\bsuch\s+as\b\s*(?=(?:.{0,60}\[\^))", "", t, flags=re.IGNORECASE)
 
-    # Remove the scaffold phrases when they occur (case-insensitive)
     for p in scaffold_patterns:
         t = re.sub(p, "", t, flags=re.IGNORECASE)
 
-    # If the model leaves "and" stranded around citations, compact them
     t = compact_consecutive_citations(t)
-
-    # Normalize marker placement and punctuation
     t = normalize_uid_marker_placement(t)
     t = ensure_period_after_citations(t)
 
-    # Hard preference: move citations to sentence end when the model inserts them mid-clause.
-    # (Conservative: only adjust simple cases where a marker is followed by a lowercase word.)
     t = re.sub(
         r"(\[\^\s*[A-Za-z0-9._-]+\s*\])\s+(?=[a-z])",
         r"\1 ",
         t
     )
 
-    # Cleanup punctuation/spacing artifacts caused by removals
     t = re.sub(r"\s+", " ", t).strip()
     t = re.sub(r"\s+([,.;:!?])", r"\1", t)
     t = re.sub(r",\s*,+", ", ", t)
@@ -824,13 +753,8 @@ def enforce_intro_summary_rules(text: str) -> str:
     return t
 
 
-
 def fallback_paragraph_from_card(card: dict) -> str:
-    """Deterministic fallback narrative when the LLM output is missing or unusable.
-
-    Uses Activity Name + Activity Description + key fields, then applies the same post-processing
-    (ICO acronym enforcement and percent normalization) to meet client rules.
-    """
+    """Deterministic fallback narrative when the LLM output is missing or unusable."""
     if not card:
         return ""
     title = (card.get("Activity Name") or card.get("Activity Title") or "").strip()
@@ -920,14 +844,12 @@ def build_portfolio_evidence_brief(df: pd.DataFrame, uid_index: dict, section_to
 
     lines = [f"Portfolio size (filtered activities): {total}."]
 
-    # FY range if present
     fy_cols = [c for c in df.columns if str(c).strip().lower() in {"fy", "fiscal year", "fiscal_year"}]
     if fy_cols:
         vals = sorted({str(v).strip() for v in df[fy_cols[0]].dropna().tolist() if str(v).strip()})
         if vals:
             lines.append("Fiscal years: " + ", ".join(vals[:6]) + ".")
 
-    # Top ICs if present
     ic_cols = [c for c in df.columns if str(c).strip().lower() in {"ico", "lead ico", "lead ic", "institute", "institute/center"}]
     if ic_cols:
         s = df[ic_cols[0]].fillna("").astype(str).str.strip()
@@ -947,7 +869,6 @@ def build_portfolio_evidence_brief(df: pd.DataFrame, uid_index: dict, section_to
     return "\n\n".join(lines).strip()
 
 
-
 def make_authoritative_style_constraints() -> str:
     return (
         "Constraints:\n"
@@ -962,10 +883,8 @@ def make_authoritative_style_constraints() -> str:
     )
 
 
-
 def build_intro_prompt(evidence_brief: str) -> list:
     evidence_brief = (evidence_brief or "").strip()
-    # Returns chat messages list for FMAPI
     return [
         {"role": "system", "content": "You write NIH triennial report narrative text."},
         {"role": "user",
@@ -1071,19 +990,10 @@ def _summary_meets_shape(md: str, min_paras: int, min_words: int, target_max: in
     return True
 
 
-
 def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str, str, str]:
     """
     Convert per-paragraph UID markers [^UID] into occurrence-based numeric footnotes,
-    and build a References section that lists EVERY footnote source in the SAME order
-    and with the SAME numbering as the Word footnotes.
-
-    Key behavior (per your requirement):
-      - Footnotes remain occurrence-based (Word/Pandoc default): 1,2,3,...
-      - References section is ALSO occurrence-based and complete (no dedupe),
-        so it includes ALL referenced footnotes.
-      - Each References line begins with ONLY the number (no brackets, no bullets).
-      - Footnote text is unchanged from your current rules (PMID preferred, else one URL).
+    and build a References section that lists EVERY footnote source in the SAME order.
     """
     UID_MARK_RE = re.compile(r"\[\^\s*([A-Za-z0-9._-]+)\s*\]")
     if not md_text:
@@ -1091,7 +1001,6 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
 
     known_uids = set(uid_index.keys())
 
-    # Drop unknown UID markers so we never emit broken anchors
     def _drop_unknown(m: re.Match) -> str:
         uid = m.group(1)
         return m.group(0) if uid in known_uids else ""
@@ -1104,7 +1013,6 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
         s = str(cell).strip()
         if not s or s.lower() in ("nan", "none", "—"):
             return []
-        # Split on semicolon/newline; keep URLs intact
         parts = re.split(r"[;\n]+", s)
         urls: list[str] = []
         for part in parts:
@@ -1138,14 +1046,6 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
         return u
 
     def _make_ref_text(uid: str) -> str:
-        """
-        Return the *exact* reference text used in the footnote.
-
-        Rules (unchanged from your current implementation):
-          - Do not include institute/IC labels or activity titles.
-          - If PMID exists: include 'PMID {pmid} — {pubmed_url}' (one PMID, one PubMed link).
-          - Else: include one web link only.
-        """
         row = uid_index.get(uid, {}) or {}
         web_urls = _split_urls(row.get("Web address(es)") or "")
         pmids = _extract_pmids(row.get("PMID(s)") or "")
@@ -1162,9 +1062,8 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
 
         return "Source unavailable"
 
-    # --- Footnotes (occurrence-based, 1..N) + References (same numbering, complete) ---
-    footnotes: list[tuple[str, str]] = []   # (fn_label, fn_text)
-    references_lines: list[str] = []        # "1 <ref>", "2 <ref>", ...
+    footnotes: list[tuple[str, str]] = []
+    references_lines: list[str] = []
 
     out_parts: list[str] = []
     last = 0
@@ -1184,27 +1083,19 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
 
         ref_text = _make_ref_text(uid).strip()
 
-        # Footnote definition (Pandoc -> Word footnote; numbering will match fn_counter)
         footnotes.append((fn_label, ref_text))
-
-        # References section line: ONLY the number prefix (no brackets/bullets)
-        # This guarantees References numbering matches Word footnote numbering.
         references_lines.append(f"{fn_counter} {ref_text}")
 
-        # Replace UID marker with occurrence-based fn marker
         out_parts.append(f"[^{fn_label}]")
 
     out_parts.append(md_clean[last:])
     md_with_numeric = "".join(out_parts)
 
-    # Pandoc footnote block
     footnote_lines: list[str] = []
     for fn_label, fn_text in footnotes:
         footnote_lines.append(f"[^{fn_label}]: {fn_text}")
     footnote_block = "\n".join(footnote_lines).strip() + ("\n" if footnote_lines else "")
 
-    # References markdown (complete, occurrence-based, numbered to match footnotes)
-    # IMPORTANT: Use blank lines so Pandoc makes each reference its own paragraph in DOCX
     references_md = "\n\n".join(references_lines).strip() + ("\n" if references_lines else "")
     
     return md_with_numeric, footnote_block, references_md
@@ -1225,32 +1116,18 @@ def _inject_references_section(md_text: str, references_md: str) -> str:
 # -----------------------------
 # Acronyms extraction + section (DETERMINISTIC)
 # -----------------------------
-# Goal:
-# - Deterministically build an Acronyms section based on actual report text (+ optional Excel-provided acronyms)
-# - No LLM usage for acronyms
-# - Stable ordering and stable formatting
-
-# Conservative tokenization rule:
-# - captures ALL-CAPS acronyms and common hyphenated forms (e.g., NIH, NCI, CAR-T, PDAC, ORWH)
-# - keeps length reasonable to avoid normal words
 _ACRONYM_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,9}(?:-[A-Z0-9]{1,10})?\b")
 
-# Tokens we never want to list as acronyms (report mechanics / citation artifacts)
 _ACRONYM_STOP = {
     "UID", "PMID", "DOI", "URL", "URLs", "U.S", "US", "USA", "FY", "FYS",
     "ICO", "ICOs", "IC", "ICs",
 }
 
-# NIH IC/ICO acronyms (used to detect common NIH organizational acronyms)
 _ICO_ACRONYMS = {
-    # NIH / ICs / major NIH org acronyms commonly present in this dataset
     "NIH", "NIAMS", "NCI", "NCATS", "NIAID", "NHLBI", "NIDDK", "NIA", "NIMH", "NINDS", "NICHD",
     "NIEHS", "NIAAA", "NIBIB", "NIGMS", "NHGRI", "NLM", "OD",
-    # Add more as needed based on your data
 }
 
-# Known expansions (extend safely over time).
-# Everything else will render as "Expansion not specified" per your style prompt requirement.
 _ACRONYM_EXPANSIONS = {
     "AI": "Artificial intelligence",
     "ML": "Machine learning",
@@ -1269,7 +1146,6 @@ _ACRONYM_EXPANSIONS = {
     "OSC": "Office of Strategic Coordination",
 }
 
-# Common NIH ICO expansions (extend as needed)
 _ICO_EXPANSIONS = {
     "NIH": "National Institutes of Health",
     "NIAMS": "National Institute of Arthritis and Musculoskeletal and Skin Diseases",
@@ -1291,7 +1167,6 @@ _ICO_EXPANSIONS = {
     "OD": "Office of the Director",
 }
 
-# Merge ICO expansions into acronym expansions (explicit card expansions still take priority)
 _ACRONYM_EXPANSIONS.update(_ICO_EXPANSIONS)
 
 def _normalize_acronym_token(tok: str) -> str:
@@ -1301,12 +1176,8 @@ def _normalize_acronym_token(tok: str) -> str:
     return tok
 
 def _extract_acronyms_from_blob(text: str) -> list[str]:
-    """
-    Extract candidate acronyms from a text blob deterministically.
-    """
     if not text:
         return []
-    # remove URLs to avoid false tokens
     cleaned = re.sub(r"https?://\S+", " ", text)
     found = []
     for m in _ACRONYM_TOKEN_RE.finditer(cleaned):
@@ -1315,21 +1186,12 @@ def _extract_acronyms_from_blob(text: str) -> list[str]:
             continue
         if tok in _ACRONYM_STOP:
             continue
-        # filter pure numbers
         if re.fullmatch(r"\d+", tok):
             continue
         found.append(tok)
     return found
 
 def _extract_explicit_acronyms_from_cards(cards: list | None) -> dict:
-    """
-    If the Excel provides an Acronyms/Abbreviations column, parse it deterministically.
-    Expected formats:
-      - "ABC=Full Name; DEF=Another Name"
-      - "ABC — Full Name"
-      - newline separated
-    Returns: { "ABC": "Full Name", "DEF": "Another Name", ... }
-    """
     if not cards:
         return {}
 
@@ -1363,7 +1225,6 @@ def _extract_explicit_acronyms_from_cards(cards: list | None) -> dict:
                 a = _normalize_acronym_token(a)
                 if not a:
                     continue
-                # strict acronym key
                 if not re.fullmatch(r"[A-Z0-9]{2,10}(?:-[A-Z0-9]{2,10})?", a):
                     continue
 
@@ -1372,47 +1233,25 @@ def _extract_explicit_acronyms_from_cards(cards: list | None) -> dict:
     return out
 
 def build_acronyms_section(md_text: str, cards: list | None = None, system_text: str | None = None) -> str:
-    """
-    Build Acronyms section BODY (no heading).
-
-    Deterministic priority:
-      1) explicit acronyms parsed from cards (if present)
-      2) inferred acronyms from generated markdown report text
-
-    Output format:
-      **ACR** — Expansion
-      **ACR** — Expansion not specified
-
-    Client rule:
-      - NIH Institutes and Centers (ICOs) should appear as acronyms in narrative paragraphs (e.g., NCI)
-        and should be defined in the Acronyms section.
-    """
     md_text = md_text or ""
 
     explicit = _extract_explicit_acronyms_from_cards(cards)
     inferred = set(_extract_acronyms_from_blob(md_text))
 
-    # Merge keys (explicit wins for expansion text)
     all_acrs = set(explicit.keys()) | inferred
 
-
-    # ---- EXCLUDE NIH ICOs FROM ACRONYMS SECTION (client requirement) ----
     ico_exclude = set(_ICO_ACRONYMS)
-    # Also exclude acronyms used in narrative enforcement (canonical ICO list)
     try:
         ico_exclude |= set(_ICO_FULLNAME_TO_ACR.values())
     except Exception:
         pass
-    # Remove excluded ICO acronyms from Acronyms section
     all_acrs = {a for a in all_acrs if a not in ico_exclude}
 
     if not all_acrs:
         return ""
 
-    # Stable order
     ordered = sorted(all_acrs)
 
-    # Identify which acronyms are still unknown after explicit + dictionary lookup
     missing: list[str] = []
     for acr in ordered:
         exp = (explicit.get(acr) or "").strip()
@@ -1421,7 +1260,6 @@ def build_acronyms_section(md_text: str, cards: list | None = None, system_text:
         if not exp:
             missing.append(acr)
 
-    # Ask LLM to expand ONLY the missing ones (guarded) — but never for ICOs
     llm_map = {}
     if missing:
         try:
@@ -1434,8 +1272,6 @@ def build_acronyms_section(md_text: str, cards: list | None = None, system_text:
         except Exception:
             llm_map = {}
 
-
-    # Final render (validated)
     lines: list[str] = []
     for acr in ordered:
         exp = (explicit.get(acr) or "").strip()
@@ -1444,7 +1280,6 @@ def build_acronyms_section(md_text: str, cards: list | None = None, system_text:
         if not exp:
             exp = (llm_map.get(acr) or "").strip()
 
-        # Normalize low-quality expansions
         if exp:
             exp_norm = exp.strip().strip(".")
             if exp_norm.lower() == acr.strip().lower():
@@ -1459,47 +1294,28 @@ def build_acronyms_section(md_text: str, cards: list | None = None, system_text:
 
     return "\n\n".join(lines).strip()
 
-# -----------------------------
-# Acronyms expansion via LLM (OPTIONAL, GUARDED)
-# -----------------------------
+
 def _validate_acronym_expansion(acr: str, exp: str) -> bool:
-    """Conservative validation to avoid hallucinated or low-quality expansions."""
     if not exp:
         return False
     exp = exp.strip()
-
-    # Reject placeholders
     if exp.lower() in {"unknown", "n/a", "not sure", "unsure", "not specified"}:
         return False
-
-    # Must be reasonably descriptive
     if len(exp) < 6:
         return False
-
-    # Avoid expansions that just repeat the acronym
     if acr.lower() in exp.lower():
-        # Sometimes valid (e.g., "TME" in "tumor microenvironment (TME)"), but your output format does not need that.
-        # Reject to keep it clean.
         return False
-
-    # Avoid garbage punctuation-only strings
     if re.fullmatch(r"[\W_]+", exp):
         return False
-
     return True
 
 
 def expand_acronyms_with_llm(system_text: str, acronyms: list[str], context_text: str, max_tokens: int = 450) -> dict:
-    """
-    Ask the model to expand ONLY the given acronyms, returning {ACR: expansion}.
-    Guarded: if JSON is invalid or expansions fail validation, they are ignored.
-    """
     acronyms = [a for a in acronyms if a and re.fullmatch(r"[A-Z0-9]{2,10}(?:-[A-Z0-9]{2,10})?", a)]
     acronyms = sorted(set(acronyms))
     if not acronyms:
         return {}
 
-    # Keep context bounded so it doesn't inflate latency/cost
     ctx = (context_text or "").strip()
     if len(ctx) > 6000:
         ctx = ctx[:6000]
@@ -1526,16 +1342,14 @@ def expand_acronyms_with_llm(system_text: str, acronyms: list[str], context_text
             {"role": "user", "content": instr + "\n" + json.dumps(payload, ensure_ascii=False)},
         ],
         max_tokens=max_tokens,
-        temperature=0.0,  # critical: reduce creative guessing
+        temperature=0.0,
     )
 
     raw = extract_text(resp).strip()
 
-    # Try parse JSON safely
     try:
         data = json.loads(raw)
     except Exception:
-        # If the model responds with junk, ignore.
         return {}
 
     out = {}
@@ -1553,7 +1367,6 @@ def expand_acronyms_with_llm(system_text: str, acronyms: list[str], context_text
         except Exception:
             conf_f = 0.0
 
-        # Only accept reasonably confident expansions
         if conf_f < 0.70:
             continue
 
@@ -1564,25 +1377,13 @@ def expand_acronyms_with_llm(system_text: str, acronyms: list[str], context_text
 
 def apply_primary_color_to_docx(docx_path: str, rgb: Tuple[int, int, int]) -> None:
     if not DOCX_AVAILABLE:
-        # Databricks Apps environment does not include python-docx
         return
 
-    """
-    Post-process the generated DOCX to apply a primary font color.
-    This is the correct way to make "all text blue" regardless of LLM prompting.
-
-    Notes/limits:
-    - Hyperlink color may still follow the Word theme if the Hyperlink style enforces it,
-      but we set run color broadly; in most cases this works.
-    - Footnotes are included as text runs by Pandoc in the body; if Word stores them
-      as actual footnote parts, python-docx has limited access. This still covers most content.
-    """
     r, g, b = rgb
     color = RGBColor(r, g, b)
 
     doc = Document(docx_path)
 
-    # Apply to styles (Normal + headings etc.)
     for style in doc.styles:
         try:
             if hasattr(style, "font") and style.font is not None:
@@ -1605,14 +1406,12 @@ def apply_primary_color_to_docx(docx_path: str, rgb: Tuple[int, int, int]) -> No
                 for nested in cell.tables:
                     _apply_in_table(nested)
 
-    # Main body
     for p in doc.paragraphs:
         _apply_runs_in_paragraph(p)
 
     for tbl in doc.tables:
         _apply_in_table(tbl)
 
-    # Headers/footers
     for section in doc.sections:
         for p in section.header.paragraphs:
             _apply_runs_in_paragraph(p)
@@ -1671,9 +1470,6 @@ _URL = re.compile(r"https?://\S+")
 _EMPTY_BRACKETS = re.compile(r"\[\s*\]")
 _ODD_SUP = re.compile(r"[\u2070-\u209F\u02B0-\u02FF]")
 
-
-
-
 def extract_text(d) -> str:
     msg = None
     try:
@@ -1702,33 +1498,16 @@ def extract_text(d) -> str:
 
 
 def hard_clean_generated_text(txt: str) -> str:
-    """
-    Aggressive post-processing for model outputs:
-    - Remove code fences, URLs, odd superscripts, and stray markdown headings.
-    - Normalize whitespace.
-    This is intentionally conservative (it does NOT rewrite meaning).
-    """
     if txt is None:
         return ""
     s = str(txt)
-
-    # Remove code fences if any slipped through
     s = re.sub(r"```(?:json|md|markdown|text)?\s*|```", "", s, flags=re.I)
-
-    # Drop markdown headings that models sometimes add
     s = re.sub(r"^\s{0,3}#{1,6}\s+.*$", "", s, flags=re.MULTILINE)
-
-    # Remove URLs (the style guide requires no inline URLs in narrative)
     s = re.sub(r"https?://\S+", "", s)
-
-    # Remove odd superscripts / modifier letters
     s = re.sub(r"[\u2070-\u209F\u02B0-\u02FF]", "", s)
-
-    # Collapse whitespace
     s = re.sub(r"[ \t]+\n", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
-
     return s.strip()
 
 def call_fmapi(endpoint: str, messages, max_tokens: int, temperature: float, retries: int = 2):
@@ -1773,7 +1552,7 @@ def call_fmapi(endpoint: str, messages, max_tokens: int, temperature: float, ret
 
 
 # =============================
-# 6.1) LLM Narrator (REPLACE-IN-PLACE)
+# 6.1) LLM Narrator
 # =============================
 NARRATOR_MAX_TOKENS = 60
 NARRATOR_TEMP = 0.35
@@ -1796,7 +1575,6 @@ def narrator_line(stage: str, detail: str, context: dict) -> str:
         "stage": stage,
         "detail": detail,
         "field": context.get("field"),
-        "activity_type": context.get("activity_type"),
         "counts": context.get("counts", {}),
     }
     messages = [
@@ -1832,10 +1610,9 @@ PLAN_SYSTEM = (
 )
 
 
-def generate_plan(field_value: str, activity_type_value: str, uid_list: list[str], counts: dict, style_override: str) -> str:
+def generate_plan(field_value: str, uid_list: list[str], counts: dict, style_override: str) -> str:
     payload = {
         "field": field_value,
-        "activity_type": activity_type_value,
         "counts": counts,
         "uids_preview": uid_list[:30],
         "sections": SECTION_ORDER,
@@ -1874,26 +1651,21 @@ def make_card(row, cmap: dict) -> dict:
     return card
 
 
-
 def enforce_single_uid_marker(paragraph: str, uid: str) -> str:
     """
     Ensures exactly one UID footnote marker at the end of the paragraph, formatted as .[^UID] (no space).
     """
     txt = (paragraph or "").strip()
     txt = re.sub(r"\s+", " ", txt).strip()
-    # Remove any existing UID/numeric markers (keeps content)
     txt = re.sub(r"\[\^\s*[A-Za-z0-9._-]+\s*\]", "", txt).strip()
 
-    # Normalize terminal punctuation
     if txt.endswith((";", ":")):
         txt = txt[:-1].rstrip()
     if not txt.endswith("."):
         txt += "."
 
-    # Append marker with NO leading space
     txt += f"[^{uid}]"
     return txt
-
 
 
 def row_facts(card):
@@ -1908,14 +1680,22 @@ def row_facts(card):
 
 
 def build_effective_system_text(base_system_text: str, style_override: str) -> str:
+    """Compose the system prompt, with optional run-specific override.
+
+    Client rule: do not expand acronyms in narrative text (especially CI/CIs).
     """
-    Appends a user-supplied override to the LLM system prompt.
-    This changes content/tone/structure, not DOCX formatting.
-    """
+    system_text = (base_system_text or "").rstrip()
+
+    # Always enforce no-acronym-expansion instruction at the system level.
+    if "NO_ACRONYM_EXPANSION_INSTRUCTION" in globals():
+        system_text = system_text + "\n\n" + NO_ACRONYM_EXPANSION_INSTRUCTION
+
     o = (style_override or "").strip()
-    if not o:
-        return base_system_text
-    return base_system_text.rstrip() + "\n\n" + "User override for THIS RUN:\n" + o + "\n"
+    if o:
+        system_text = system_text + "\n\n" + "User override for THIS RUN:\n" + o + "\n"
+
+    return system_text
+
 
 
 def generate_row_paragraph(system_text: str, card: dict) -> str:
@@ -1940,7 +1720,6 @@ def generate_row_paragraph(system_text: str, card: dict) -> str:
     return enforce_single_uid_marker(txt, uid)
 
 
-
 def top_participating_ics(cards, k=8):
     counter = collections.Counter()
     for c in cards:
@@ -1958,9 +1737,9 @@ def sanitize_intro(md: str) -> str:
     return md.strip()
 
 
-def generate_intro(system_text: str, cards: list[dict], uid_index: dict, field_value: str, activity_type_value: str):
+def generate_intro(system_text: str, cards: list[dict], uid_index: dict, field_value: str):
     payload = {
-        "meta": {"field_filter": field_value, "activity_type_filter": activity_type_value, "fiscal_years": []},
+        "meta": {"field_filter": field_value, "fiscal_years": []},
         "counts": {"rows": len(cards), "unique_uids": len(uid_index)},
         "institutes_top": top_participating_ics(cards, k=8),
         "allowed_uids": sorted(uid_index.keys()),
@@ -2024,9 +1803,9 @@ def generate_intro(system_text: str, cards: list[dict], uid_index: dict, field_v
     return txt
 
 
-def generate_summary(system_text: str, cards: list[dict], uid_index: dict, field_value: str, activity_type_value: str) -> str:
+def generate_summary(system_text: str, cards: list[dict], uid_index: dict, field_value: str) -> str:
     payload = {
-        "meta": {"field_filter": field_value, "activity_type_filter": activity_type_value, "fiscal_years": []},
+        "meta": {"field_filter": field_value, "fiscal_years": []},
         "counts": {"rows": len(cards), "unique_uids": len(uid_index)},
         "institutes_top": top_participating_ics(cards, k=8),
         "allowed_uids": sorted(uid_index.keys()),
@@ -2035,8 +1814,7 @@ def generate_summary(system_text: str, cards: list[dict], uid_index: dict, field
     instr = (
         "- Write the SUMMARY for an NIH Triennial report.\n"
         "- Write EXACTLY 2 paragraphs.\n"
-        "- Each paragraph must be substantive and at least "
-        f"{SUMMARY_MIN_WORDS} words.\n"
+        f"- Each paragraph must be substantive and at least {SUMMARY_MIN_WORDS} words.\n"
         "- Use ONLY the provided payload.\n"
         "- Do not invent fiscal years; if fiscal_years is empty, do not mention an FY range.\n"
         "- Include at least two UID markers overall, formatted as [^<UID>] and placed sentence-terminal, using ONLY allowed_uids.\n"
@@ -2086,10 +1864,10 @@ def generate_summary(system_text: str, cards: list[dict], uid_index: dict, field
     return txt
 
 def pick_sections(card: dict) -> list[str]:
+    # Activity Type removed from routing signal per client requirement
     text = " ".join([
         card.get("Activity Name", ""),
         card.get("Activity Description", ""),
-        card.get("Activity Type", ""),
         card.get("Importance", ""),
         card.get("Collaborating ICOs/Agencies/Orgs", ""),
     ]).lower()
@@ -2130,6 +1908,117 @@ def pick_sections(card: dict) -> list[str]:
     return [s for s in SECTION_ORDER if s in hits]
 
 
+# -----------------------------
+# Section routing with rationale
+# -----------------------------
+ROUTING_MAX_TOKENS = int(os.environ.get("ROUTING_MAX_TOKENS", "220"))
+
+def _safe_json_loads(txt: str) -> dict:
+    try:
+        return json.loads(txt)
+    except Exception:
+        # Try to extract first JSON object from mixed output
+        m = re.search(r"\{.*\}", txt or "", flags=re.S)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return {}
+        return {}
+
+def llm_route_uid_to_single_section(system_text: str, uid: str, card: dict, candidate_sections: list[str]) -> tuple[str, str, dict]:
+    """
+    Returns: (selected_section, rationale, excluded_sections_map)
+      - selected_section: one item from SECTION_ORDER
+      - rationale: 1–2 sentences explaining why this UID belongs in that section
+      - excluded_sections_map: {section_name: reason_for_exclusion}
+    If the model fails, falls back to heuristic routing (first candidate).
+    """
+    candidates = [s for s in candidate_sections if s in SECTION_ORDER]
+    if not candidates:
+        candidates = list(SECTION_ORDER)
+
+    payload = {
+        "uid": uid,
+        "activity_name": card.get("Activity Name", "—"),
+        "activity_description": card.get("Activity Description", "—"),
+        "importance": card.get("Importance", "—"),
+        "collaborators": card.get("Collaborating ICOs/Agencies/Orgs", "—"),
+        "candidate_sections": candidates,
+        "all_sections": list(SECTION_ORDER),
+    }
+
+    instr = (
+        "You are routing ONE activity (UID) into EXACTLY ONE report section.\n"
+        "Return STRICT JSON ONLY (no markdown):\n"
+        "{\n"
+        "  \"selected_section\": \"<one section title from candidate_sections>\",\n"
+        "  \"rationale\": \"<1-2 sentences grounded in the activity text>\",\n"
+        "  \"excluded_sections\": { \"<other candidate section>\": \"<why not>\", ... }\n"
+        "}\n"
+        "Rules:\n"
+        "- selected_section MUST be one of candidate_sections.\n"
+        "- rationale must cite concrete cues (methods, domain terms, resource types) from the activity text.\n"
+        "- excluded_sections must include ONLY the other candidate_sections (not all sections).\n"
+        "- If multiple candidates fit, pick the BEST match and explain why the others are secondary.\n"
+    )
+
+    try:
+        resp = call_fmapi(
+            ENDPOINT,
+            messages=[
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": instr + "\n" + json.dumps(payload, ensure_ascii=False)},
+            ],
+            max_tokens=ROUTING_MAX_TOKENS,
+            temperature=0.0,
+        )
+        txt = extract_text(resp).strip()
+        data = _safe_json_loads(txt)
+        selected = (data.get("selected_section") or "").strip()
+        rationale = (data.get("rationale") or "").strip()
+        excluded = data.get("excluded_sections") or {}
+        if not isinstance(excluded, dict):
+            excluded = {}
+        if selected not in candidates:
+            selected = candidates[0]
+        if not rationale:
+            # Provide a grounded fallback rationale (heuristic) if model returns empty
+            rationale = "Selected based on dominant topical/method cues in the activity title/description."
+        # keep only candidate sections (excluding selected)
+        excluded = {k: str(v).strip() for k, v in excluded.items() if k in candidates and k != selected and str(v).strip()}
+        return selected, rationale, excluded
+    except Exception:
+        # Pure heuristic fallback
+        selected = candidates[0] if candidates else SECTION_ORDER[0]
+        rationale = "Selected by rule-based keyword routing when model routing was unavailable."
+        excluded = {k: "Not the primary thematic match under keyword routing." for k in candidates if k != selected}
+        return selected, rationale, excluded
+
+
+def route_all_uids(system_text: str, uid_index: dict) -> tuple[dict, dict]:
+    """
+    Builds:
+      - section_to_uids: {section: [uid,...]} where each UID appears exactly once globally
+      - uid_routing: {uid: {selected_section, rationale, excluded_sections{sec:reason}, candidates[]}}
+    """
+    section_to_uids = {sec: [] for sec in SECTION_ORDER}
+    uid_routing = {}
+
+    for uid, card in uid_index.items():
+        candidates = pick_sections(card)  # heuristic candidates
+        selected, rationale, excluded = llm_route_uid_to_single_section(system_text, uid, card, candidates)
+        section_to_uids.setdefault(selected, []).append(uid)
+        uid_routing[uid] = {
+            "selected_section": selected,
+            "rationale": rationale,
+            "excluded_sections": excluded,
+            "candidates": [c for c in candidates if c in SECTION_ORDER],
+        }
+
+    return section_to_uids, uid_routing
+
+
 def section_synthesis(system_text: str, section_name: str, uids: list[str], uid_index: dict):
     instr = (
             "- Write one or two cohesive synthesis paragraphs for the section title below.\n"
@@ -2144,12 +2033,11 @@ def section_synthesis(system_text: str, section_name: str, uids: list[str], uid_
             "- Do NOT start any paragraph with 'Research', 'Research in', 'Research on', 'Studies', or 'Researchers'.\n"
             "- Do NOT use the template 'Research in <section> has...'.\n"
             "- Start each paragraph with one of these instead:\n"
-            "  (a) A method/approach (e.g., 'Longitudinal cohort designs...', 'Network-enabled trials...')\n"
-            "  (b) A scientific advance/result (e.g., 'Evidence now links...', 'Emerging data indicate...')\n"
-            "  (c) A resource/infrastructure (e.g., 'Clinical trial networks...', 'Data commons...')\n"
+            "  (a) A method/approach\n"
+            "  (b) A scientific advance/result\n"
+            "  (c) A resource/infrastructure\n"
             "- Ensure the first 8 words of each section synthesis paragraph are structurally distinct.\n"
         )
-
 
     rows = []
     for u in uids[:6]:
@@ -2177,9 +2065,6 @@ def section_synthesis(system_text: str, section_name: str, uids: list[str], uid_
     return txt
 
 
-
-
-
 def assemble_markdown(
     summary_text: str,
     intro_text: str,
@@ -2189,22 +2074,6 @@ def assemble_markdown(
     uid_to_paragraph: dict,
     cards: list | None = None
 ) -> str:
-    """
-    Assemble report Markdown in mandatory order:
-      1) Introduction
-      2) Summary
-      3) Thematic sections (in section_order)
-      4) Acronyms
-      5) References (filled later by _inject_references_section)
-
-    Enhancements:
-      - Adds deterministic Entry numbers for each activity (global across report).
-      - Adds '(Entry n)' immediately adjacent to every UID citation marker in narrative sections.
-      - Applies NIH-style cleanup to avoid academic meta-citation phrasing.
-      - For every thematic section (everything after Summary), prints a UID list immediately
-        under the section heading, and prints each UID as a standalone header line immediately
-        above its activity paragraph (to match client formatting requirements).
-    """
     md_parts: list[str] = []
 
     intro_clean = hard_clean_generated_text((intro_text or "").strip())
@@ -2223,22 +2092,16 @@ def assemble_markdown(
     intro_clean = ensure_period_after_citations(intro_clean)
     summary_clean = ensure_period_after_citations(summary_clean)
 
-    # Deterministic narrative post-processing (client rules)
     intro_clean = postprocess_narrative(intro_clean)
     summary_clean = postprocess_narrative(summary_clean)
 
-    # FINAL Intro/Summary enforcement (silent citations only; no Entry labels; no evidentiary lead-ins)
-    # FINAL Intro/Summary enforcement (silent citations only; no Entry labels; no evidentiary lead-ins)
     intro_clean = enforce_intro_summary_rules(intro_clean)
     summary_clean = enforce_intro_summary_rules(summary_clean)
 
-    # Ensure paragraphs do not end abruptly if the model was token-truncated
     intro_clean = finalize_multparagraph_text(intro_clean)
     summary_clean = finalize_multparagraph_text(summary_clean)
 
     md_parts.append("## Introduction\n")
-
-
     if intro_clean:
         md_parts.append(intro_clean + "\n")
 
@@ -2252,25 +2115,16 @@ def assemble_markdown(
             continue
 
         md_parts.append(f"\n## {sec}\n")
-
-        # 1) Print UID list directly under the section heading (matches screenshot format)
-        # Example: "272_NCI, 282_NCI, 933_NIBIB"
         md_parts.append(", ".join(uids) + "\n")
 
-        # 2) Section synthesis removed (Model A): every paragraph must be anchored to a UID
-
-        # 3) Activity paragraphs, with UID header line above each paragraph
         for uid in uids:
             entry_n = uid_to_entry.get(uid)
             entry_label = f"Entry {entry_n}" if entry_n is not None else "Entry"
 
-            # Always print the UID header line
             md_parts.append(f"\nUID {uid}\n")
 
             para = (uid_to_paragraph.get(uid) or "").strip()
             if (not para) or re.match(r"^See\s+Entry\s+\d+\b", para, flags=re.IGNORECASE):
-                # If the paragraph is missing OR is a non-informative pointer (e.g., "See Entry 2..."),
-                # fall back to a deterministic narrative from the row card. If still unavailable, skip.
                 card = None
                 if isinstance(cards, dict):
                     card = cards.get(uid)
@@ -2290,7 +2144,6 @@ def assemble_markdown(
             para = strip_raw_uid_tokens(para)
             para = postprocess_narrative(para)
 
-            # Remove any trailing UID marker; we will re-append in a controlled way
             para = re.sub(r"\[\^\s*[A-Za-z0-9._-]+\s*\]\s*$", "", para).strip()
 
             if para.endswith((";", ":")):
@@ -2298,7 +2151,6 @@ def assemble_markdown(
             if not para.endswith("."):
                 para += "."
 
-            # Next line: paragraph text (no UID in prose) + deterministic Entry label + UID marker
             md_parts.append(f"\n{para} ({entry_label})[^{uid}]\n")
 
     md_text_so_far = "\n".join(md_parts).strip()
@@ -2317,17 +2169,9 @@ def assemble_markdown(
     md_parts.append("\n## References\n\n")
 
     return "\n".join(md_parts).strip() + "\n"
+
+
 def ensure_pandoc() -> str:
-    """
-    Ensures pandoc is available.
-
-    Order of preference:
-    1) Use pandoc already on PATH (common in custom images).
-    2) Use previously downloaded /tmp/pandoc/bin/pandoc.
-    3) Attempt to download pandoc from GitHub (requires outbound internet + curl).
-
-    If all fail, raises a clear error with remediation guidance.
-    """
     existing = shutil.which("pandoc")
     if existing:
         return existing
@@ -2373,190 +2217,18 @@ chmod +x "$WORKDIR/bin/pandoc"
     return str(pandoc_bin)
 
 
-    install_sh = r"""
-set -euo pipefail
-PVER="3.3"
-WORKDIR="/tmp/pandoc"
-mkdir -p "$WORKDIR"
-cd "$WORKDIR"
-curl -L -o pandoc.tgz "https://github.com/jgm/pandoc/releases/download/${PVER}/pandoc-${PVER}-linux-amd64.tar.gz"
-tar -xzf pandoc.tgz
-mkdir -p "$WORKDIR/bin"
-cp "pandoc-${PVER}/bin/pandoc" "$WORKDIR/bin/pandoc"
-chmod +x "$WORKDIR/bin/pandoc"
-"""
-    subprocess.run(["bash", "-lc", install_sh], check=True)
-    pandoc_bin = Path("/tmp/pandoc/bin/pandoc")
-    if not pandoc_bin.exists():
-        raise RuntimeError("Pandoc installation failed.")
-    return str(pandoc_bin)
-
-
-
-def apply_square_bracket_footnote_markers_docx(docx_path: str) -> None:
-    """Post-process a DOCX to display footnote references as [n] in running text.
-
-    This preserves real Word footnotes (the <w:footnoteReference/> remains),
-    and simply injects bracket text nodes around the reference in word/document.xml.
-    """
-    docx_file = Path(docx_path)
-    if not docx_file.exists():
-        raise RuntimeError(f"DOCX not found for post-processing: {docx_path}")
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="docx_sqbr_"))
-    try:
-        with zipfile.ZipFile(docx_file, "r") as zin:
-            zin.extractall(tmp_dir)
-
-        document_xml = tmp_dir / "word" / "document.xml"
-        if not document_xml.exists():
-            raise RuntimeError("DOCX is missing word/document.xml; cannot apply square brackets.")
-
-        xml = document_xml.read_text(encoding="utf-8")
-
-        # Replace runs that contain only a footnoteReference (optionally with rPr)
-        # with the same run but with bracket text around the reference.
-        pattern = re.compile(
-            r"<w:r(\s[^>]*)?>\s*(<w:rPr>[\s\S]*?</w:rPr>\s*)?<w:footnoteReference\s+w:id=\"(\d+)\"\s*/>\s*</w:r>",
-            re.IGNORECASE
-        )
-
-        def _repl(m: re.Match) -> str:
-            r_attrs = m.group(1) or ""
-            rpr = m.group(2) or ""
-            fid = m.group(3)
-            return (
-                f"<w:r{r_attrs}>"
-                f"{rpr}"
-                f"<w:t xml:space=\"preserve\">[</w:t>"
-                f"<w:footnoteReference w:id=\"{fid}\"/>"
-                f"<w:t xml:space=\"preserve\">]</w:t>"
-                f"</w:r>"
-            )
-
-        new_xml, n = pattern.subn(_repl, xml)
-
-        # If nothing matched, do a fallback that still won't crash.
-        if n == 0:
-            # Very conservative: only wrap bare footnoteReference tags that are NOT already bracketed.
-            new_xml = re.sub(
-                r"(?<!\[)<w:footnoteReference\s+w:id=\"(\d+)\"\s*/>(?!\])",
-                r"<w:t xml:space=\"preserve\">[</w:t><w:footnoteReference w:id=\"\1\"/><w:t xml:space=\"preserve\">]</w:t>",
-                xml
-            )
-
-        document_xml.write_text(new_xml, encoding="utf-8")
-
-        # Re-zip (overwrite original)
-        tmp_out = docx_file.with_suffix(".tmp.docx")
-        with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-            for p in tmp_dir.rglob("*"):
-                if p.is_file():
-                    zout.write(p, p.relative_to(tmp_dir).as_posix())
-
-        tmp_out.replace(docx_file)
-
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-def apply_superscript_commas_between_consecutive_footnote_refs_docx(docx_path: str) -> None:
-    """
-    Post-process a DOCX so consecutive Word footnote references render with commas:
-      12 13  ->  12,13
-
-    Implementation:
-      - Unzips DOCX
-      - Edits word/document.xml
-      - Detects back-to-back <w:footnoteReference/> runs with only whitespace between
-      - Inserts a superscript comma run between them
-
-    Notes:
-      - This preserves real Word footnotes (does not change footnote IDs or numbering).
-      - It only affects consecutive references in the main document body (document.xml).
-    """
-    docx_file = Path(docx_path)
-    if not docx_file.exists():
-        raise RuntimeError(f"DOCX not found for post-processing: {docx_path}")
-
-    tmp_dir = Path(tempfile.mkdtemp(prefix="docx_fncomma_"))
-    try:
-        with zipfile.ZipFile(docx_file, "r") as zin:
-            zin.extractall(tmp_dir)
-
-        document_xml = tmp_dir / "word" / "document.xml"
-        if not document_xml.exists():
-            raise RuntimeError("DOCX is missing word/document.xml; cannot apply footnote commas.")
-
-        xml = document_xml.read_text(encoding="utf-8")
-
-        # Pattern: a run that contains a footnoteReference, followed immediately (whitespace-only) by
-        # another run that contains a footnoteReference.
-        #
-        # We insert a NEW superscript comma run between them.
-        #
-        # We keep the match conservative so we do not insert commas across words or punctuation.
-        pattern = re.compile(
-            r"("
-            r"</w:footnoteReference>\s*</w:r>"          # end of first footnote reference run
-            r")"
-            r"\s*"
-            r"("
-            r"<w:r(?:\s[^>]*)?>\s*"                     # start of next run
-            r"(?:<w:rPr>[\s\S]*?</w:rPr>\s*)?"
-            r"<w:footnoteReference\s+w:id=\"\d+\"\s*/>" # next footnote reference
-            r")",
-            re.IGNORECASE
-        )
-
-        # Superscript comma run (no space). If you want "12, 13" instead, change "," to ", "
-        comma_run = (
-            r"<w:r>"
-            r"<w:rPr><w:vertAlign w:val=\"superscript\"/></w:rPr>"
-            r"<w:t xml:space=\"preserve\">, </w:t>"
-            r"</w:r>"
-        )
-
-        # Avoid double-inserting if a comma run is already present between references
-        # by running until stable but with a hard cap.
-        max_passes = 5
-        passes = 0
-        while passes < max_passes:
-            new_xml, n = pattern.subn(r"\1" + comma_run + r"\2", xml)
-            if n == 0:
-                break
-            xml = new_xml
-            passes += 1
-
-        document_xml.write_text(xml, encoding="utf-8")
-
-        # Re-zip (overwrite original)
-        tmp_out = docx_file.with_suffix(".tmp.docx")
-        with zipfile.ZipFile(tmp_out, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-            for p in tmp_dir.rglob("*"):
-                if p.is_file():
-                    zout.write(p, p.relative_to(tmp_dir).as_posix())
-
-        tmp_out.replace(docx_file)
-
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-def export_docx(md_text: str, out_dir: str, field_value: str, activity_type_value: str, lua_pagebreak_enabled: bool, square_brackets_enabled: bool) -> str:
+def export_docx(md_text: str, out_dir: str, field_value: str, lua_pagebreak_enabled: bool, square_brackets_enabled: bool) -> str:
     pandoc = ensure_pandoc()
 
-    # Final hard sanitize to enforce client formatting rules even if upstream steps regress.
     md_text = replace_percent_sign(md_text)
     if "%" in md_text:
-        # Last-resort conversion (should be redundant, but guarantees no % leaks).
         md_text = re.sub(r"(\d(?:\d|\.\d+)?)\s*%", r"\1 percent", md_text)
         md_text = md_text.replace("%", " percent")
 
-    # Remove any placeholder lines that may have slipped in.
     md_text = re.sub(r"^\s*See Entry\s+\d+\s+for\s+the\s+full\s+activity\s+narrative\.?\s*$", "", md_text, flags=re.IGNORECASE | re.MULTILINE)
 
     field_part = _safe_filename(field_value)
-    atype_part = _safe_filename(activity_type_value)
-    docx_path = str(Path(out_dir) / f"Triennial_Data_{field_part}_{atype_part}.docx")
+    docx_path = str(Path(out_dir) / f"Triennial_Data_{field_part}.docx")
     md_path = str(Path(out_dir) / "report.md")
     Path(md_path).write_text(md_text, encoding="utf-8")
 
@@ -2587,11 +2259,6 @@ def export_docx(md_text: str, out_dir: str, field_value: str, activity_type_valu
             "STDERR:\n" + (p.stderr or "(empty)") + "\n"
         )
 
-    #if square_brackets_enabled:
-    #    apply_square_bracket_footnote_markers_docx(docx_path)
-    
-    #apply_superscript_commas_between_consecutive_footnote_refs_docx(docx_path)
-
     return docx_path
 
 
@@ -2617,17 +2284,12 @@ def maybe_copy_to_volume(local_docx_path: str, volume_dir: str):
 
 
 def write_style_prompt_to_dbfs(style_prompt_dbfs_path: str, system_text: str):
-    """
-    Optional: persist the effective system prompt back into DBFS style_prompt.json.
-    Keeps the same JSON structure {"content": "..."}.
-    """
     host = get_workspace_host()
     url = f"{host}/api/2.0/dbfs/put"
 
     payload_obj = {"content": system_text}
     payload_bytes = json.dumps(payload_obj, ensure_ascii=False, indent=2).encode("utf-8")
 
-    # dbfs/put has a 1MB limit; this prompt should be small. If you ever exceed it, switch to create/add-block.
     r = requests.post(
         url,
         headers=auth_headers(),
@@ -2657,7 +2319,6 @@ with st.expander("Inputs", expanded=True):
         volume_out_dir = st.text_input("Final output volume dir (optional)", value=DEFAULT_VOLUME_OUT_DIR)
         copy_to_volume = st.checkbox("Also copy final DOCX into Volume directory", value=False)
 
-    # UI removed: LUA always enabled; square-bracket footnotes disabled
     use_lua_filter = True
     use_square_bracket_filter = False
     st.caption("Tip: After changing inputs, click 'Load Inputs' to restage files and refresh dropdown values.")
@@ -2685,32 +2346,18 @@ system_text_base = load_system_text(STYLE_PROMPT_LOCAL)
 df = load_excel(EXCEL_LOCAL)
 
 field_col = resolve_column(df, FIELD_COL)
-atype_col = resolve_column(df, ACTIVITY_TYPE_COL)
 
 # =============================
-# 9.1) Cascaded dropdowns (side-by-side)
+# 9.1) Field dropdown (Activity Type filter removed)
 # =============================
 field_values = dropdown_values(df, field_col)
 
-c_left, c_right = st.columns(2)
-with c_left:
-    selected_field = st.selectbox(
-        "Field",
-        field_values,
-        index=field_values.index("Cancer") if "Cancer" in field_values else 0,
-        key="field_select",
-    )
-
-df_field = df[df[field_col].astype(str) == str(selected_field)].copy()
-atype_values = dropdown_values(df_field, atype_col)
-
-with c_right:
-    selected_activity_type = st.selectbox(
-        "Activity Type",
-        atype_values,
-        index=0 if len(atype_values) > 0 else 0,
-        key="atype_select",
-    )
+selected_field = st.selectbox(
+    "Field",
+    field_values,
+    index=field_values.index("Cancer") if "Cancer" in field_values else 0,
+    key="field_select",
+)
 
 st.divider()
 
@@ -2749,14 +2396,16 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
     if "plan_uids" not in st.session_state:
         st.session_state.plan_uids = []
 
-    if build_plan:
-        if not selected_activity_type:
-            st.error("Cannot build preview because Activity Type is empty for the selected Field.")
-            st.stop()
+    if "plan_sections" not in st.session_state:
+        st.session_state.plan_sections = []
+    if "plan_section_counts" not in st.session_state:
+        st.session_state.plan_section_counts = {}
+    if "sections_confirmed" not in st.session_state:
+        st.session_state.sections_confirmed = False
 
+    if build_plan:
         filtered_for_plan = df[
             (df[field_col].astype(str) == str(selected_field))
-            & (df[atype_col].astype(str) == str(selected_activity_type))
         ].copy()
         filtered_for_plan = filtered_for_plan.fillna("—")
 
@@ -2778,7 +2427,7 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
 
             st.write(
                 f"Preview: {counts['filtered_rows']} filtered rows, {counts['unique_uids']} unique UIDs "
-                f"for Field='{selected_field}' and Activity Type='{selected_activity_type}'."
+                f"for Field='{selected_field}'."
             )
             st.caption("First UIDs (up to 30):")
             st.code(", ".join(uids[:30]) if uids else "(none)")
@@ -2788,7 +2437,6 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
             with st.spinner("Generating preview (LLM)…"):
                 plan_txt = generate_plan(
                     field_value=str(selected_field),
-                    activity_type_value=str(selected_activity_type),
                     uid_list=uids,
                     counts=counts,
                     style_override=style_override,
@@ -2797,19 +2445,70 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
             st.subheader("preview (LLM-generated)")
             st.write(plan_txt)
 
+            # --- Section inclusion + rationale preview (requires user confirmation) ---
+            effective_system_text_preview = build_effective_system_text(system_text_base, style_override)
+            section_to_uids_preview, uid_routing_preview = route_all_uids(effective_system_text_preview, uid_index_for_plan)
+
+            included_sections = [sec for sec in SECTION_ORDER if section_to_uids_preview.get(sec)]
+            section_counts = {sec: len(section_to_uids_preview.get(sec, [])) for sec in included_sections}
+
+            st.subheader("sections that will be included")
+            if not included_sections:
+                st.info("No sections matched the filtered activities; the report will include Introduction and Summary only.")
+            else:
+                _sec_rows = [{"Section": sec, "Activities (UIDs)": section_counts[sec]} for sec in included_sections]
+                st.dataframe(pd.DataFrame(_sec_rows), use_container_width=True, hide_index=True)
+
+            st.subheader("why each UID is in its section")
+            _why_rows = []
+            for _uid, _meta in uid_routing_preview.items():
+                _why_rows.append({
+                    "UID": _uid,
+                    "Selected Section": _meta.get("selected_section", "—"),
+                    "Rationale (LLM)": _meta.get("rationale", "—"),
+                    "Other Candidates Excluded": ", ".join(sorted((_meta.get("excluded_sections") or {}).keys())) or "—",
+                })
+            st.dataframe(pd.DataFrame(_why_rows), use_container_width=True, hide_index=True)
+
+            show_excluded = st.checkbox(
+                "Show excluded candidate sections per UID (with reasons)",
+                value=False,
+                key="show_excluded_preview",
+                help="Displays which candidate sections were not selected for each UID and why."
+            )
+            if show_excluded:
+                for _uid, _meta in uid_routing_preview.items():
+                    _ex = _meta.get("excluded_sections") or {}
+                    if not _ex:
+                        continue
+                    st.markdown(f"**UID {_uid}** — selected: {_meta.get('selected_section','—')}")
+                    _rows = [{"Excluded Section": k, "Reason": v} for k, v in _ex.items()]
+                    st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)# Persist preview for gating Generate Report
+            st.session_state.plan_sections = included_sections
+            st.session_state.plan_section_counts = section_counts
+            st.session_state.sections_confirmed = False  # reset on every new plan
+
             st.session_state.plan_text = plan_txt
             st.session_state.plan_counts = counts
             st.session_state.plan_uids = uids
             st.session_state.plan_ready = True
 
+    confirm_sections = st.checkbox(
+        "Yes — confirm the sections above will be included in the report",
+        value=bool(st.session_state.sections_confirmed),
+        disabled=not st.session_state.plan_ready,
+        help="This confirms the section list derived from the filtered activities and routing rules.",
+    )
+    st.session_state.sections_confirmed = bool(confirm_sections)
+
     proceed = st.checkbox(
         "Yes — proceed to generate using this plan",
         value=False,
-        disabled=not st.session_state.plan_ready,
+        disabled=not (st.session_state.plan_ready and st.session_state.sections_confirmed),
     )
 
 st.divider()
-generate = st.button("Generate Report", type="primary", disabled=not (st.session_state.plan_ready and proceed))
+generate = st.button("Generate Report", type="primary", disabled=not (st.session_state.plan_ready and st.session_state.sections_confirmed and proceed))
 
 narration_placeholder = st.empty()
 st.caption("Live narration updates here (replaces in place).")
@@ -2832,21 +2531,14 @@ if generate:
     progress = st.progress(0, text="Starting…")
     status = st.empty()
 
-    ctx = {"field": str(selected_field), "activity_type": str(selected_activity_type), "counts": {}}
+    ctx = {"field": str(selected_field), "counts": {}}
     narration_every_n = int(NARRATE_EVERY_N_DEFAULT)
 
-    if not selected_activity_type:
-        st.error("Cannot generate report because Activity Type is empty for the selected Field.")
-        st.stop()
-
-    # Build effective system text for this run (LLM content control)
     effective_system_text = build_effective_system_text(system_text_base, style_override)
 
-    # Optional: persist effective style prompt to DBFS + restage for the run
     if persist_style_override and style_override.strip():
         try:
             write_style_prompt_to_dbfs(style_prompt_dbfs.strip(), effective_system_text)
-            # Restage style prompt into local, so load_system_text reads the updated content in future runs
             data = dbfs_read_all(style_prompt_dbfs.strip())
             if data:
                 dbfs_write_file(STYLE_PROMPT_LOCAL, data)
@@ -2856,16 +2548,10 @@ if generate:
 
 
     def parse_hex_color(s: str) -> Optional[Tuple[int, int, int]]:
-        """
-        Accepts 'blue', '#0000ff', '0000ff', 'rgb(0,0,255)'.
-        Returns (r, g, b) or None.
-        """
         if not s:
             return None
-
         t = s.strip().lower()
 
-        # Common names
         if t in ("blue", "primary blue"):
             return (0, 0, 255)
         if t == "red":
@@ -2875,14 +2561,12 @@ if generate:
         if t == "black":
             return (0, 0, 0)
 
-        # rgb(r,g,b)
         m = re.search(r"rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)", t)
         if m:
             r, g, b = [int(x) for x in m.groups()]
             if all(0 <= x <= 255 for x in (r, g, b)):
                 return (r, g, b)
 
-        # hex
         t = t.lstrip("#")
         if re.fullmatch(r"[0-9a-f]{6}", t):
             r = int(t[0:2], 16)
@@ -2892,18 +2576,16 @@ if generate:
 
         return None
 
-    # DOCX formatting color override (actual Word styling)
     docx_primary_rgb = parse_hex_color(docx_color_text)
 
     try:
         set_narration("start", "Initializing generation pipeline.", ctx)
 
         status.write("Filtering rows…")
-        set_narration("filter", f"Filtering dataset for Field='{selected_field}' and Activity Type='{selected_activity_type}'.", ctx)
+        set_narration("filter", f"Filtering dataset for Field='{selected_field}'.", ctx)
 
         filtered = df[
             (df[field_col].astype(str) == str(selected_field))
-            & (df[atype_col].astype(str) == str(selected_activity_type))
         ].copy()
         filtered = filtered.fillna("—")
 
@@ -2920,10 +2602,23 @@ if generate:
         cards = [make_card(r, cmap) for _, r in filtered.iterrows()]
 
         uid_index = {}
+        excluded_uids = {}  # {uid: reason} where possible
+
         for c in cards:
-            uid = c.get("Unique ID", "—")
-            if uid and uid != "—":
-                uid_index[uid] = c
+            uid = (c.get("Unique ID", "—") or "—").strip()
+
+            if not uid or uid == "—":
+                # Can't list by UID if missing; track count only
+                excluded_uids.setdefault("__MISSING_UID__", 0)
+                excluded_uids["__MISSING_UID__"] += 1
+                continue
+
+            if uid in uid_index:
+                # Duplicate UID: enforce rule that each UID is discussed only once globally
+                excluded_uids[uid] = "Duplicate UID encountered in filtered data; only one record is kept for reporting."
+                continue
+
+            uid_index[uid] = c
 
         if not uid_index:
             set_narration("cards", "No valid Unique IDs found in filtered data.", ctx)
@@ -2931,6 +2626,23 @@ if generate:
             st.stop()
 
         ctx["counts"] = {"filtered_rows": int(len(filtered)), "unique_uids": int(len(uid_index))}
+
+
+        # --- Excluded UID reporting (input/data-level exclusions) ---
+        # Note: Missing UID rows are counted under __MISSING_UID__ (no specific UID to display).
+        if excluded_uids:
+            with st.expander("UIDs excluded from reporting (and why)"):
+                rows = []
+                missing_n = excluded_uids.get("__MISSING_UID__", 0)
+                if missing_n:
+                    rows.append({"UID": "—", "Reason": f"{missing_n} row(s) missing Unique ID were excluded (cannot be cited or discussed)."})
+                for k, v in excluded_uids.items():
+                    if k == "__MISSING_UID__":
+                        continue
+                    rows.append({"UID": k, "Reason": v})
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
         progress.progress(0.20, text="Generating row paragraphs…")
         set_narration("rows", f"Generating narrative paragraphs for {len(uid_index)} activities.", ctx)
@@ -2955,25 +2667,24 @@ if generate:
             progress.progress(0.20 + 0.25 * (i / total), text=f"Row paragraphs: {i}/{total}")
 
         progress.progress(0.50, text="Routing to sections…")
-        set_narration("sections", "Routing activities into report sections.", ctx)
+        set_narration("sections", "Routing activities into report sections (one UID per section) and generating rationales.", ctx)
 
-        section_to_uids = {sec: [] for sec in SECTION_ORDER}
+        section_to_uids, uid_routing = route_all_uids(effective_system_text, uid_index)
 
-        for uid, card in uid_index.items():
-            for sec in pick_sections(card):
-                section_to_uids.setdefault(sec, []).append(uid)
-        # Build evidence brief ONLY AFTER section_to_uids is populated
+        # Persist routing metadata for UI download/review
+        st.session_state["uid_routing"] = uid_routing
+
         evidence_brief = build_portfolio_evidence_brief(filtered, uid_index, section_to_uids)
 
         progress.progress(0.58, text="Generating Summary…")
         set_narration("summary", "Generating the executive Summary section.", ctx)
         with st.spinner("Model is thinking for the Summary…"):
-            summary_text = generate_summary(effective_system_text, cards, uid_index, selected_field, selected_activity_type)
+            summary_text = generate_summary(effective_system_text, cards, uid_index, selected_field)
 
         progress.progress(0.65, text="Generating Introduction…")
         set_narration("intro", "Generating the multi-paragraph Introduction.", ctx)
         with st.spinner("Model is thinking for the Introduction…"):
-            intro_text = generate_intro(effective_system_text, cards, uid_index, selected_field, selected_activity_type)
+            intro_text = generate_intro(effective_system_text, cards, uid_index, selected_field)
 
         progress.progress(0.78, text="Generating section syntheses…")
         set_narration("synth", "Generating section-level syntheses.", ctx)
@@ -3004,8 +2715,9 @@ if generate:
         md_numeric, footnote_block, references_md = build_footnotes_from_uid_markers(md, uid_index)
         md_with_refs = _inject_references_section(md_numeric, references_md)
         md = md_with_refs.rstrip() + "\n\n" + footnote_block.strip() + "\n"
-        # Final deterministic sanitization pass (guarantees no '%' and enforces ICO acronyms)
+
         md = enforce_ico_acronyms(md)
+        md = revert_ci_expansions(md)
         md = replace_percent_sign(md)
 
         progress.progress(0.93, text="Exporting DOCX…")
@@ -3016,24 +2728,20 @@ if generate:
                 md,
                 LOCAL_OUT_DIR,
                 selected_field,
-                selected_activity_type,
                 lua_pagebreak_enabled=True,
                 square_brackets_enabled=False,
             )
 
-        # ✅ Apply DOCX primary color override here (this is what makes text blue)
         if docx_primary_rgb is not None and DOCX_AVAILABLE:
             set_narration("format", "Applying DOCX primary text color formatting.", ctx)
             with st.spinner("Applying DOCX text color…"):
                 apply_primary_color_to_docx(docx_path, docx_primary_rgb)
-        
         elif docx_primary_rgb is not None and not DOCX_AVAILABLE:
             st.warning(
                 "DOCX color override requested, but python-docx is not available in this environment. "
                  "The report was generated successfully without color formatting."
-                )
+            )
 
-        
         if copy_to_volume:
             set_narration("volume", "Copying the DOCX into the configured Volume directory.", ctx)
             with st.spinner("Copying to Volume…"):
@@ -3059,8 +2767,30 @@ if generate:
         )
 
         full_url = f"{get_workspace_host()}{url}"
-        #st.link_button("Open FileStore link", full_url)
         st.caption(url)
+
+        # --- Routing rationale review (post-generation) ---
+        if st.session_state.get("uid_routing"):
+            with st.expander("Why each UID was placed in its section (and what was excluded)"):
+                _meta = st.session_state.get("uid_routing") or {}
+                _rows = []
+                for _uid, _m in _meta.items():
+                    _rows.append({
+                        "UID": _uid,
+                        "Selected Section": _m.get("selected_section", "—"),
+                        "Rationale (LLM)": _m.get("rationale", "—"),
+                        "Excluded Candidates": ", ".join(sorted((_m.get("excluded_sections") or {}).keys())) or "—",
+                    })
+                st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+
+                st.markdown("**Excluded candidate sections (per UID):**")
+                for _uid, _m in _meta.items():
+                    _ex = _m.get("excluded_sections") or {}
+                    if not _ex:
+                        continue
+                    st.markdown(f"- **{_uid}** (selected: {_m.get('selected_section','—')}):")
+                    for _sec, _why in _ex.items():
+                        st.markdown(f"  - {_sec}: {_why}")
 
         with st.expander("Technical details"):
             st.write("DOCX local:", docx_path)
@@ -3071,7 +2801,6 @@ if generate:
             st.write("LUA filter enabled:", bool(use_lua_filter))
             st.write("Style override persisted:", bool(persist_style_override and style_override.strip()))
             st.write("DOCX primary color override:", docx_primary_rgb)
-
             if copy_to_volume:
                 st.write("Copied to Volume dir:", volume_out_dir)
 
