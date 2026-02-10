@@ -30,6 +30,33 @@ except Exception:
 # 0) App config
 # =============================
 st.set_page_config(page_title="Triennial Report Generator", layout="wide")
+# =============================
+# UI layout: constrain content width (prevents widgets from stretching to far right)
+# =============================
+st.markdown(
+    """
+    <style>
+      /* Limit the content width even when layout="wide" */
+      section.main > div.block-container{
+        max-width: 1180px;     /* adjust: 980–1400 depending on preference */
+        padding-left: 2.2rem;
+        padding-right: 2.2rem;
+      }
+
+      /* Keep tables from looking edge-to-edge */
+      div[data-testid="stDataFrame"]{
+        max-width: 100%;
+      }
+
+      /* Optional: slightly reduce selectbox width feel */
+      div[data-testid="stSelectbox"]{
+        max-width: 100%;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("Triennial Report Generator")
 st.caption("Select inputs, then filter by Field to generate a publication-ready DOCX report.")
 st.write("APP VERSION: 2025-12-30 v13 (Activity Type filter removed)")
@@ -2144,6 +2171,13 @@ def assemble_markdown(
             para = strip_raw_uid_tokens(para)
             para = postprocess_narrative(para)
 
+            # Client requirement: keep Entry numbers, but never as citation-like text at paragraph end
+            para = re.sub(r"\(\s*Entry\s+\d+\s*\)", "", para, flags=re.IGNORECASE)
+            para = re.sub(r"\bEntry\s+\d+\b", "", para, flags=re.IGNORECASE)
+            para = re.sub(r"\s{2,}", " ", para).strip()
+            para = re.sub(r"\s+([,.;:!?])", r"\1", para)
+
+
             para = re.sub(r"\[\^\s*[A-Za-z0-9._-]+\s*\]\s*$", "", para).strip()
 
             if para.endswith((";", ":")):
@@ -2151,7 +2185,8 @@ def assemble_markdown(
             if not para.endswith("."):
                 para += "."
 
-            md_parts.append(f"\n{para} ({entry_label})[^{uid}]\n")
+            md_parts.append(f"\n{para}[^{uid}] [{entry_label}]\n")
+
 
     md_text_so_far = "\n".join(md_parts).strip()
     acr_body = build_acronyms_section(
@@ -2352,12 +2387,20 @@ field_col = resolve_column(df, FIELD_COL)
 # =============================
 field_values = dropdown_values(df, field_col)
 
-selected_field = st.selectbox(
-    "Field",
-    field_values,
-    index=field_values.index("Cancer") if "Cancer" in field_values else 0,
-    key="field_select",
-)
+# =============================
+# 9.1) Field dropdown (constrained width)
+# =============================
+field_values = dropdown_values(df, field_col)
+
+_field_left, _field_gutter = st.columns([0.72, 0.28])  # left column + right gutter
+with _field_left:
+    selected_field = st.selectbox(
+        "Field",
+        field_values,
+        index=field_values.index("Cancer") if "Cancer" in field_values else 0,
+        key="field_select",
+    )
+
 
 st.divider()
 
@@ -2402,6 +2445,10 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
         st.session_state.plan_section_counts = {}
     if "sections_confirmed" not in st.session_state:
         st.session_state.sections_confirmed = False
+    if "uid_routing_preview" not in st.session_state:
+        st.session_state.uid_routing_preview = {}
+    if "included_sections" not in st.session_state:
+        st.session_state.included_sections = []
 
     if build_plan:
         filtered_for_plan = df[
@@ -2457,7 +2504,10 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
                 st.info("No sections matched the filtered activities; the report will include Introduction and Summary only.")
             else:
                 _sec_rows = [{"Section": sec, "Activities (UIDs)": section_counts[sec]} for sec in included_sections]
-                st.dataframe(pd.DataFrame(_sec_rows), use_container_width=True, hide_index=True)
+                #st.dataframe(pd.DataFrame(_sec_rows), use_container_width=True, hide_index=True)
+                _plan_tbl_left, _plan_tbl_gutter = st.columns([0.72, 0.28])
+                with _plan_tbl_left:
+                    st.dataframe(pd.DataFrame(_sec_rows), use_container_width=True, hide_index=True)
 
             st.subheader("why each UID is in its section")
             _why_rows = []
@@ -2466,32 +2516,106 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
                     "UID": _uid,
                     "Selected Section": _meta.get("selected_section", "—"),
                     "Rationale (LLM)": _meta.get("rationale", "—"),
-                    "Other Candidates Excluded": ", ".join(sorted((_meta.get("excluded_sections") or {}).keys())) or "—",
+                    "Excluded Candidates": ", ".join(sorted((_meta.get("excluded_sections") or {}).keys())) or "—",
                 })
-            st.dataframe(pd.DataFrame(_why_rows), use_container_width=True, hide_index=True)
+            #st.dataframe(pd.DataFrame(_why_rows), use_container_width=True, hide_index=True)
+            _plan_why_left, _plan_why_gutter = st.columns([0.72, 0.28])
+            with _plan_why_left:
+                st.dataframe(pd.DataFrame(_why_rows), use_container_width=True, hide_index=True)
 
-            show_excluded = st.checkbox(
-                "Show excluded candidate sections per UID (with reasons)",
-                value=False,
-                key="show_excluded_preview",
-                help="Displays which candidate sections were not selected for each UID and why."
-            )
-            if show_excluded:
-                for _uid, _meta in uid_routing_preview.items():
-                    _ex = _meta.get("excluded_sections") or {}
-                    if not _ex:
-                        continue
-                    st.markdown(f"**UID {_uid}** — selected: {_meta.get('selected_section','—')}")
-                    _rows = [{"Excluded Section": k, "Reason": v} for k, v in _ex.items()]
-                    st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)# Persist preview for gating Generate Report
+            # --- Excluded candidate sections (per UID): always shown AFTER the UID routing table ---
+            # NOTE: This block is inside the main Preflight expander, so it must NOT create another expander.
+            st.markdown("**Excluded candidate sections (per UID):**")
+            any_excluded = False
+            for _uid, _meta in uid_routing_preview.items():
+                _ex = _meta.get("excluded_sections") or {}
+                if not _ex:
+                    continue
+                any_excluded = True
+                st.markdown(f"- **{_uid}** (selected: {_meta.get('selected_section','—')}):")
+                for _sec, _why in _ex.items():
+                    st.markdown(f"  - {_sec}: {_why}")
+
+            if not any_excluded:
+                st.caption("No excluded candidate sections were recorded for the current UID routing.")
             st.session_state.plan_sections = included_sections
             st.session_state.plan_section_counts = section_counts
+            st.session_state.uid_routing_preview = uid_routing_preview
+            st.session_state.included_sections = included_sections
             st.session_state.sections_confirmed = False  # reset on every new plan
 
             st.session_state.plan_text = plan_txt
             st.session_state.plan_counts = counts
             st.session_state.plan_uids = uids
             st.session_state.plan_ready = True
+
+    # -----------------------------
+    # Persistent preview + rationales
+    # (Render from session_state so it remains visible even after Generate Report is clicked)
+    # -----------------------------
+    # NOTE: Do not create a nested expander here. Keep everything inside the Preflight expander.
+    if st.session_state.get("plan_ready") and (not build_plan):
+        st.markdown("---")
+        st.subheader("Plan preview and routing rationale")
+
+        _counts = st.session_state.get("plan_counts") or {}
+        _uids = st.session_state.get("plan_uids") or []
+        _plan_txt = st.session_state.get("plan_text") or ""
+
+        st.write(
+            f"Preview: {_counts.get('filtered_rows', 0)} filtered rows, {_counts.get('unique_uids', 0)} unique UIDs "
+            f"for Field='{selected_field}'."
+        )
+        st.caption("First UIDs (up to 30):")
+        st.code(", ".join(_uids[:30]) if _uids else "(none)")
+
+        st.subheader("preview (LLM-generated)")
+        st.write(_plan_txt)
+
+        _included_sections = st.session_state.get("included_sections") or st.session_state.get("plan_sections") or []
+        _section_counts = st.session_state.get("plan_section_counts") or {}
+
+        st.subheader("sections that will be included")
+        if not _included_sections:
+            st.info("No sections matched the filtered activities; the report will include Introduction and Summary only.")
+        else:
+            _sec_rows = [{"Section": sec, "Activities (UIDs)": _section_counts.get(sec, 0)} for sec in _included_sections]
+            _plan_tbl_left, _plan_tbl_gutter = st.columns([0.72, 0.28])
+            with _plan_tbl_left:
+                st.dataframe(pd.DataFrame(_sec_rows), use_container_width=True, hide_index=True)
+
+        _uid_routing_preview = st.session_state.get("uid_routing_preview") or {}
+        if _uid_routing_preview:
+            st.subheader("why each UID is in its section")
+            _why_rows = []
+            for _uid, _meta in _uid_routing_preview.items():
+                _why_rows.append({
+                    "UID": _uid,
+                    "Selected Section": _meta.get("selected_section", "—"),
+                    "Rationale (LLM)": _meta.get("rationale", "—"),
+                    "Excluded Candidates": ", ".join(sorted((_meta.get("excluded_sections") or {}).keys())) or "—",
+                })
+
+            _plan_why_left, _plan_why_gutter = st.columns([0.72, 0.28])
+            with _plan_why_left:
+                st.dataframe(pd.DataFrame(_why_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("**Excluded candidate sections (per UID):**")
+            any_excluded = False
+            for _uid, _meta in _uid_routing_preview.items():
+                _ex = _meta.get("excluded_sections") or {}
+                if not _ex:
+                    continue
+                any_excluded = True
+                st.markdown(f"- **{_uid}** (selected: {_meta.get('selected_section','—')}):")
+                for _sec, _why in _ex.items():
+                    st.markdown(f"  - {_sec}: {_why}")
+
+            if not any_excluded:
+                st.caption("No excluded candidate sections were recorded for the current UID routing.")
+        else:
+            st.caption("Build Plan to generate routing rationale.")
+
 
     confirm_sections = st.checkbox(
         "Yes — confirm the sections above will be included in the report",
@@ -2506,6 +2630,8 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
         value=False,
         disabled=not (st.session_state.plan_ready and st.session_state.sections_confirmed),
     )
+
+
 
 st.divider()
 generate = st.button("Generate Report", type="primary", disabled=not (st.session_state.plan_ready and st.session_state.sections_confirmed and proceed))
@@ -2769,41 +2895,9 @@ if generate:
         full_url = f"{get_workspace_host()}{url}"
         st.caption(url)
 
-        # --- Routing rationale review (post-generation) ---
-        if st.session_state.get("uid_routing"):
-            with st.expander("Why each UID was placed in its section (and what was excluded)"):
-                _meta = st.session_state.get("uid_routing") or {}
-                _rows = []
-                for _uid, _m in _meta.items():
-                    _rows.append({
-                        "UID": _uid,
-                        "Selected Section": _m.get("selected_section", "—"),
-                        "Rationale (LLM)": _m.get("rationale", "—"),
-                        "Excluded Candidates": ", ".join(sorted((_m.get("excluded_sections") or {}).keys())) or "—",
-                    })
-                st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
-
-                st.markdown("**Excluded candidate sections (per UID):**")
-                for _uid, _m in _meta.items():
-                    _ex = _m.get("excluded_sections") or {}
-                    if not _ex:
-                        continue
-                    st.markdown(f"- **{_uid}** (selected: {_m.get('selected_section','—')}):")
-                    for _sec, _why in _ex.items():
-                        st.markdown(f"  - {_sec}: {_why}")
-
-        with st.expander("Technical details"):
-            st.write("DOCX local:", docx_path)
-            st.write("DOCX size (bytes):", Path(docx_path).stat().st_size)
-            st.write("Published URL (relative):", url)
-            st.write("Published URL (absolute):", full_url)
-            st.write("Endpoint:", ENDPOINT)
-            st.write("LUA filter enabled:", bool(use_lua_filter))
-            st.write("Style override persisted:", bool(persist_style_override and style_override.strip()))
-            st.write("DOCX primary color override:", docx_primary_rgb)
-            if copy_to_volume:
-                st.write("Copied to Volume dir:", volume_out_dir)
-
+        # NOTE: UID routing rationale is intentionally shown during **Build Plan** (preflight),
+        # not after generation. This keeps the post-generation UI focused on download + diagnostics.
+    
     except Exception as e:
         progress.progress(1.0, text="Failed.")
         set_narration("error", f"Generation failed: {e}", ctx)
