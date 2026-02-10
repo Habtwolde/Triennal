@@ -13,6 +13,9 @@ import collections
 import shutil
 import requests
 from typing import Optional, Tuple
+from functools import lru_cache
+import xml.etree.ElementTree as ET
+import calendar
 
 import pandas as pd
 import streamlit as st
@@ -59,7 +62,7 @@ st.markdown(
 
 st.title("Triennial Report Generator")
 st.caption("Select inputs, then filter by Field to generate a publication-ready DOCX report.")
-st.write("APP VERSION: 2025-12-30 v13 (Activity Type filter removed)")
+
 
 
 # =============================
@@ -718,7 +721,44 @@ def compact_consecutive_citations(t: str) -> str:
     t = re.sub(r"\b(and|or)\s+(?=\[\^)", "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s+([,.;:!?])", r"\1", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
+    # Keep the Introduction/Summary concise: 2–3 sentences maximum.
+    t = _limit_to_n_sentences(t, n=3)
+
     return t
+
+
+
+def _limit_to_n_sentences(text: str, n: int = 3) -> str:
+    """Deterministically keep the first n sentences (simple punctuation-based segmentation)."""
+    if not text:
+        return text
+    s = re.sub(r"\s+", " ", str(text)).strip()
+    if not s:
+        return s
+    out = []
+    start = 0
+    i = 0
+    while i < len(s) and len(out) < n:
+        ch = s[i]
+        if ch in '.!?':
+            j = i + 1
+            # absorb closing quotes/brackets
+            while j < len(s) and s[j] in "'\")]}":
+                j += 1
+            seg = s[start:j].strip()
+            if seg:
+                out.append(seg)
+            # skip whitespace after sentence end
+            while j < len(s) and s[j].isspace():
+                j += 1
+            start = j
+            i = j
+            continue
+        i += 1
+    # If we never hit punctuation, treat as one sentence.
+    if not out:
+        out = [s]
+    return " ".join(out).strip()
 
 def enforce_intro_summary_rules(text: str) -> str:
     """Hard rules for Introduction and Summary."""
@@ -764,6 +804,9 @@ def enforce_intro_summary_rules(text: str) -> str:
     t = compact_consecutive_citations(t)
     t = normalize_uid_marker_placement(t)
     t = ensure_period_after_citations(t)
+
+    # Intro/Summary must be citation-free: strip any remaining UID footnote markers.
+    t = re.sub(r"\[\^\s*[A-Za-z0-9._-]+\s*\]", "", t)
 
     t = re.sub(
         r"(\[\^\s*[A-Za-z0-9._-]+\s*\])\s+(?=[a-z])",
@@ -919,8 +962,8 @@ def build_intro_prompt(evidence_brief: str) -> list:
             "Draft the INTRODUCTION for this chapter.\n"
             + make_authoritative_style_constraints()
             + "\nUse ONLY the evidence brief below. If not in the brief, omit it.\n"
-            "Write 2–3 paragraphs (180–260 words total). Include: portfolio scope, why it matters, and 2–3 concrete examples by title.\n"
-            "Do not invent statistics. Do not include bracket citations.\n"
+            "Write 2–3 sentences total. Define scope and why it matters; you may mention 1–2 concrete examples by title if they fit.\n"
+            "Do not invent statistics. Do not include any citations, UID markers, footnotes, or bracket references.\n"
             "\nEVIDENCE BRIEF:\n" + evidence_brief
         },
     ]
@@ -935,8 +978,8 @@ def build_summary_prompt(evidence_brief: str) -> list:
             "Draft the SUMMARY for this chapter.\n"
             + make_authoritative_style_constraints()
             + "\nUse ONLY the evidence brief below.\n"
-            "Write 1–2 paragraphs (140–220 words total). Capture cross-cutting themes and concrete highlights by title.\n"
-            "Do not invent statistics. Do not include bracket citations.\n"
+            "Write 2–3 sentences total. Capture cross-cutting themes and concrete highlights by title.\n"
+            "Do not invent statistics. Do not include any citations, UID markers, footnotes, or bracket references.\n"
             "\nEVIDENCE BRIEF:\n" + evidence_brief
         },
     ]
@@ -1077,10 +1120,139 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
         web_urls = _split_urls(row.get("Web address(es)") or "")
         pmids = _extract_pmids(row.get("PMID(s)") or "")
 
+        # --- PMID → NLM (PubMed) reference formatting ---
+        # If PMID metadata cannot be fetched/parsed, fall back to a stable PubMed URL.
+        @lru_cache(maxsize=2048)
+        def _pmid_to_nlm(pmid: str) -> Optional[str]:
+            pmid = (pmid or "").strip()
+            if not pmid:
+                return None
+
+            # NCBI E-utilities (no API key required for low volume; add key if needed later)
+            url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            params = {"db": "pubmed", "id": pmid, "retmode": "xml"}
+            try:
+                r = requests.get(url, params=params, timeout=20)
+                r.raise_for_status()
+                xml_text = r.text
+            except Exception:
+                return None
+
+            try:
+                root = ET.fromstring(xml_text)
+            except Exception:
+                return None
+
+            def _t(x: Optional[str]) -> str:
+                return (x or "").strip()
+
+            # First PubmedArticle only
+            art = root.find(".//PubmedArticle")
+            if art is None:
+                return None
+
+            # Authors
+            authors = []
+            for a in art.findall(".//Article/AuthorList/Author"):
+                last = _t(a.findtext("LastName"))
+                initials = _t(a.findtext("Initials"))
+                coll = _t(a.findtext("CollectiveName"))
+                if coll:
+                    authors.append(coll)
+                elif last and initials:
+                    authors.append(f"{last} {initials}")
+                elif last:
+                    authors.append(last)
+
+            if authors:
+                if len(authors) > 6:
+                    authors_txt = ", ".join(authors[:6]) + ", et al"
+                else:
+                    authors_txt = ", ".join(authors)
+                authors_txt = authors_txt.rstrip(".") + "."
+            else:
+                authors_txt = ""
+
+            # Title
+            title = _t(art.findtext(".//Article/ArticleTitle"))
+            title = re.sub(r"\s+", " ", title).strip()
+            if title and not title.endswith("."):
+                title += "."
+            # Journal
+            journal = _t(art.findtext(".//Article/Journal/ISOAbbreviation")) or _t(art.findtext(".//Article/Journal/Title"))
+            if journal and not journal.endswith("."):
+                journal += "."
+
+            # Pub date
+            year = _t(art.findtext(".//Article/Journal/JournalIssue/PubDate/Year")) or _t(art.findtext(".//ArticleDate/Year"))
+            month = _t(art.findtext(".//Article/Journal/JournalIssue/PubDate/Month")) or _t(art.findtext(".//ArticleDate/Month"))
+            day = _t(art.findtext(".//Article/Journal/JournalIssue/PubDate/Day")) or _t(art.findtext(".//ArticleDate/Day"))
+
+            def _month_norm(m: str) -> str:
+                m = (m or "").strip()
+                if not m:
+                    return ""
+                # PubMed sometimes returns numeric month or 3-letter abbreviation
+                if m.isdigit():
+                    mi = int(m)
+                    if 1 <= mi <= 12:
+                        return calendar.month_abbr[mi]
+                    return ""
+                m3 = m[:3].title()
+                # Accept already-abbreviated forms (Jan, Feb, Mar, ...)
+                if m3 in list(calendar.month_abbr):
+                    return m3
+                return m3
+
+            month = _month_norm(month)
+            date_bits = [b for b in [year, month, day] if b]
+            date_txt = (" ".join(date_bits) + ";") if date_bits else ""
+
+            # Volume/Issue/Pages
+            vol = _t(art.findtext(".//Article/Journal/JournalIssue/Volume"))
+            iss = _t(art.findtext(".//Article/Journal/JournalIssue/Issue"))
+            pages = _t(art.findtext(".//Article/Pagination/MedlinePgn"))
+            vip = ""
+            if vol:
+                vip += vol
+                if iss:
+                    vip += f"({iss})"
+            if pages:
+                vip += f":{pages}"
+            if vip and not vip.endswith("."):
+                vip += "."
+
+            # DOI
+            doi = ""
+            for aid in art.findall(".//ArticleIdList/ArticleId"):
+                if (aid.get("IdType") or "").lower() == "doi":
+                    doi = _t(aid.text)
+                    break
+            doi_txt = f" doi: {doi}." if doi else ""
+
+            # PMID
+            pmid_txt = f" PMID: {pmid}."
+
+            # NLM-ish assembly (concise, journal-article style)
+            parts = [p for p in [authors_txt, title, journal, date_txt + (vip or "")] if p]
+            if not parts:
+                return None
+            core = " ".join([p.strip() for p in parts]).strip()
+            # Ensure single spaces and clean punctuation spacing
+            core = re.sub(r"\s+", " ", core)
+            core = re.sub(r"\s+([,.;:])", r"\1", core).strip()
+
+            return (core + doi_txt + pmid_txt).strip()
+
         if pmids:
             pmid = pmids[0]
+            nlm = _pmid_to_nlm(pmid)
+            if nlm:
+                return nlm
+
+            # Fallback if PubMed metadata is unreachable
             pubmed_url = _canonicalize_url(f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/")
-            return f"PMID {pmid} — {pubmed_url}"
+            return f"PMID: {pmid}. {pubmed_url}"
 
         if web_urls:
             url = _canonicalize_url(web_urls[0])
@@ -1088,6 +1260,7 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
                 return url
 
         return "Source unavailable"
+
 
     footnotes: list[tuple[str, str]] = []
     references_lines: list[str] = []
@@ -2185,7 +2358,7 @@ def assemble_markdown(
             if not para.endswith("."):
                 para += "."
 
-            md_parts.append(f"\n{para}[^{uid}] [{entry_label}]\n")
+            md_parts.append(f"\n{para}[^{uid}]\n")
 
 
     md_text_so_far = "\n".join(md_parts).strip()
