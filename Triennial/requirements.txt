@@ -5,3 +5,5 @@ requests
 watchdog
 python-docx
 lxml
+pypandoc==1.13
+pypandoc-binary==1.13

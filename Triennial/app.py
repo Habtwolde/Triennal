@@ -63,8 +63,6 @@ st.markdown(
 st.title("Triennial Report Generator")
 st.caption("Select inputs, then filter by Field to generate a publication-ready DOCX report.")
 
-
-
 # =============================
 # UI behavior
 # =============================
@@ -72,54 +70,33 @@ NARRATE_EVERY_N_DEFAULT = 3
 SHOW_PARTIAL_OUTPUT = False
 SILENT_STAGING = True
 
+# =============================
+# LLM Token Limits
+# =============================
+
+# ROW_MAX_TOKENS = 800          # per-UID paragraph generation
+# SUMMARY_MAX_TOKENS = 500      # summary generation (if used)
+# PLAN_MAX_TOKENS = 1200        # plan generation (if used)
+
+# =============================
+# LLM Generation Controls
+# =============================
+
+ROW_MAX_TOKENS = 800
+ROW_TEMP = 0.2
+
+PLAN_MAX_TOKENS = 1200
+PLAN_TEMP = 0.1
+
+SUMMARY_MAX_TOKENS = 500
+SUMMARY_TEMP = 0.1
 
 
 # =============================
-# Acronym handling
+# Narrative shaping constants
 # =============================
-DISABLE_ACRONYM_EXPANSION = True  # Client requirement: do NOT expand acronyms in narrative text
-PROTECTED_ACRONYMS = {"CI", "CIs", "C.I.", "C.I.s", "C.I.s.", "C.I", "CI.", "CIs."}
-
-NO_ACRONYM_EXPANSION_INSTRUCTION = (
-    "Do NOT expand acronyms in the narrative text. Keep acronyms exactly as written in the source. "
-    "Never expand CI or CIs."
-)
-# =============================
-# 1) Default paths & constants
-# =============================
-BASE_DBFS_DEFAULT = "dbfs:/FileStore/triennial"
-
-DEFAULT_EXCEL_DBFS = f"{BASE_DBFS_DEFAULT}/Triennial Data Source_Master File of All Submissions_OEPR Ch3 Writers (1).xlsx"
-DEFAULT_STYLE_PROMPT_DBFS = f"{BASE_DBFS_DEFAULT}/style_prompt.json"
-DEFAULT_REFERENCE_DOCX_DBFS = f"{BASE_DBFS_DEFAULT}/reference.docx"
-
-DEFAULT_LUA_FILTER_DBFS = f"{BASE_DBFS_DEFAULT}/h2_pagebreak.lua"
-DEFAULT_SQUARE_FILTER_DBFS = f"{BASE_DBFS_DEFAULT}/h2_square_bracket_footnotes.lua"
-
-DEFAULT_WORKING_OUT_DBFS = "dbfs:/FileStore/triennial/out"
-DEFAULT_VOLUME_OUT_DIR = "/Volumes/dpcpsi/gold/triennial_reports"
-
-LOCAL_ASSETS_DIR = "/tmp/triennial_assets"
-LOCAL_OUT_DIR = "/tmp/triennial_out"
-Path(LOCAL_ASSETS_DIR).mkdir(parents=True, exist_ok=True)
-Path(LOCAL_OUT_DIR).mkdir(parents=True, exist_ok=True)
-
-EXCEL_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "master.xlsx")
-STYLE_PROMPT_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "style_prompt.json")
-REFERENCE_DOCX_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "reference.docx")
-LUA_FILTER_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "h2_pagebreak.lua")
-SQUARE_FILTER_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "h2_square_bracket_footnotes.lua")
-
-ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
-
-TEMPERATURE = 0.25
-MAX_TOKENS_ROW = 550
-MAX_TOKENS_SYN = 450
-MAX_TOKENS_INTRO = 1200
-MAX_TOKENS_SUMMARY = 900
-
 INTRO_MIN_PARAS = 2
-INTRO_TARGET_MAX = 2
+INTRO_TARGET_MAX = 3
 INTRO_MIN_WORDS = 170
 INTRO_RETRY_LIMIT = 4
 
@@ -129,15 +106,29 @@ SUMMARY_MIN_WORDS = 140
 SUMMARY_RETRY_LIMIT = 4
 
 
-FIELD_COL = "Field"
-# ACTIVITY_TYPE_COL removed per client requirement (no Activity Type filtering)
+# =============================
+# LLM endpoint & generation defaults
+# =============================
+# Databricks Model Serving endpoint name (override via env var TRIENNIAL_ENDPOINT).
+ENDPOINT = (os.environ.get("TRIENNIAL_ENDPOINT") or "databricks-meta-llama-3-3-70b-instruct").strip()
 
+# Default generation params (kept consistent with the original app.py)
+TEMPERATURE = float(os.environ.get('TRIENNIAL_TEMPERATURE', '0.25'))
+MAX_TOKENS_ROW = int(os.environ.get('TRIENNIAL_MAX_TOKENS_ROW', '550'))
+MAX_TOKENS_SYN = int(os.environ.get('TRIENNIAL_MAX_TOKENS_SYN', '450'))
+MAX_TOKENS_INTRO = int(os.environ.get('TRIENNIAL_MAX_TOKENS_INTRO', '1200'))
+MAX_TOKENS_SUMMARY = int(os.environ.get('TRIENNIAL_MAX_TOKENS_SUMMARY', '900'))
+
+# Sentence-ending punctuation detector used by post-processing
+_END_PUNCT_RE = re.compile(r"[.!?][\'\"\)\]]?\s*$")
+# Canonical column names expected from the master Excel file
 CANON = [
     "Submitting ICO", "Lead ICO", "Unique ID", "Collaborating ICOs/Agencies/Orgs",
     "Activity Name", "Activity Description", "Activity Type", "Field", "Importance",
     "Web address(es)", "PMID(s)", "Notes", "Notes.1"
 ]
 
+# Field ordering used for routing & report section sequence
 SECTION_ORDER = [
     "Advanced Imaging & AI Tools",
     "Combination & Targeted Therapies",
@@ -152,6 +143,61 @@ SECTION_ORDER = [
     "Screening & Early Detection",
     "Tumor Microenvironment & Immunology",
 ]
+
+# =============================
+# Acronym handling
+# =============================
+DISABLE_ACRONYM_EXPANSION = True  # Client requirement: do NOT expand acronyms in narrative text
+PROTECTED_ACRONYMS = {"CI", "CIs", "C.I.", "C.I.s", "C.I.s.", "C.I", "CI.", "CIs."}
+
+NO_ACRONYM_EXPANSION_INSTRUCTION = (
+    "Do NOT expand acronyms in the narrative text. Keep acronyms exactly as written in the source. "
+    "Never expand CI or CIs."
+)
+# =============================
+# 1) Default paths & constants
+# =============================
+# Client portability: default to reading inputs from the *app folder* (the folder that contains this app.py).
+# This avoids hard-coding DBFS paths that differ across workspaces.
+APP_DIR = Path(__file__).resolve().parent
+APP_ASSETS_DIR = (APP_DIR / "assets") if (APP_DIR / "assets").exists() else APP_DIR
+
+import shutil
+print("Pandoc on PATH:", shutil.which("pandoc"))
+
+def _app_path(p: str) -> str:
+    """Resolve a user-supplied path. Relative paths are resolved under APP_ASSETS_DIR."""
+    p = (p or "").strip()
+    if not p:
+        return ""
+    if p.startswith("dbfs:") or p.startswith("/dbfs/"):
+        return p  # leave DBFS paths untouched (optional support)
+    if p.startswith("/"):
+        return p
+    return str(APP_ASSETS_DIR / p)
+
+# Defaults expect these files to be shipped alongside app.py (or under ./assets/)
+DEFAULT_EXCEL_PATH = _app_path("Triennial Data Source_Master File of All Submissions_OEPR Ch3 Writers (1).xlsx")
+DEFAULT_STYLE_PROMPT_PATH = _app_path("style_prompt.json")
+DEFAULT_REFERENCE_DOCX_PATH = _app_path("reference.docx")
+DEFAULT_LUA_FILTER_PATH = _app_path("h2_pagebreak.lua")
+DEFAULT_SQUARE_FILTER_PATH = _app_path("h2_square_bracket_footnotes.lua")
+
+# Output options (DBFS publish is optional; download_button works without DBFS)
+DEFAULT_WORKING_OUT_DBFS = "dbfs:/FileStore/triennial/out"
+DEFAULT_VOLUME_OUT_DIR = "/Volumes/dpcpsi/gold/triennial_reports"
+
+# Local, writable staging area inside the App container
+LOCAL_ASSETS_DIR = "/tmp/triennial_assets"
+LOCAL_OUT_DIR = "/tmp/triennial_out"
+Path(LOCAL_ASSETS_DIR).mkdir(parents=True, exist_ok=True)
+Path(LOCAL_OUT_DIR).mkdir(parents=True, exist_ok=True)
+
+EXCEL_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "master.xlsx")
+STYLE_PROMPT_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "style_prompt.json")
+REFERENCE_DOCX_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "reference.docx")
+LUA_FILTER_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "h2_pagebreak.lua")
+SQUARE_FILTER_LOCAL = str(Path(LOCAL_ASSETS_DIR) / "h2_square_bracket_footnotes.lua")
 
 
 # =============================
@@ -286,94 +332,118 @@ def dbfs_put_large(dbfs_path: str, data: bytes, overwrite: bool = True, block_si
         dbfs_close(handle)
 
 def stage_assets_or_stop(
-    excel_dbfs: str,
-    style_prompt_dbfs: str,
-    reference_docx_dbfs: str,
-    lua_filter_dbfs: str,
+    excel_path: str,
+    style_prompt_path: str,
+    reference_docx_path: str,
+    lua_filter_path: str,
+    square_filter_path: str,
 ):
-    required = [
-        (excel_dbfs, EXCEL_LOCAL),
-        (style_prompt_dbfs, STYLE_PROMPT_LOCAL),
-        (reference_docx_dbfs, REFERENCE_DOCX_LOCAL),
-    ]
+    """
+    Stage required assets into the App container's writable area (/tmp).
 
-    # LUA page-break filter is mandatory
-    optional = [(lua_filter_dbfs, LUA_FILTER_LOCAL)]
+    - Preferred mode: read from local app folder (relative paths under APP_ASSETS_DIR).
+    - Optional compatibility: if a path starts with dbfs:/ or /dbfs/, read via DBFS REST.
+    """
 
-    staged_info = []  # (src_dbfs, dst_local, file_size, mtime, sha256)
+    def _is_dbfs(p: str) -> bool:
+        p = (p or "").strip()
+        return p.startswith("dbfs:") or p.startswith("/dbfs/")
 
-    missing_required = []
-    for src_dbfs, dst_local in required:
+    def _read_src_bytes(src: str) -> bytes:
+        src = (src or "").strip()
+        if not src:
+            return b""
+        if _is_dbfs(src):
+            return dbfs_read_all(src)
+        # local file
+        return Path(src).read_bytes()
+
+    def _stage_one(src: str, dst_local: str, required: bool = True, label: str = "") -> Tuple[bool, Optional[str], Optional[str]]:
+        """Returns (ok, error_kind, error_detail)."""
+        src = (src or "").strip()
+        if not src:
+            if required:
+                return False, "missing", f"{label or 'File'} path is empty."
+            return True, None, None
         try:
-            status = dbfs_get_status(src_dbfs)
-            data = dbfs_read_all(src_dbfs)
-            if not data:
-                raise RuntimeError("Empty read")
-            sha = hashlib.sha256(data).hexdigest()
-            dbfs_write_file(dst_local, data)
-            staged_info.append((src_dbfs, dst_local, status.get('file_size'), status.get('modification_time'), sha))
-        except Exception:
-            missing_required.append(src_dbfs)
-
-    for src_dbfs, dst_local in optional:
-        try:
-            status = dbfs_get_status(src_dbfs)
-            data = dbfs_read_all(src_dbfs)
-            if data:
+            if _is_dbfs(src):
+                status = dbfs_get_status(src)
+                data = _read_src_bytes(src)
+                if not data:
+                    raise RuntimeError("Empty read from DBFS.")
                 sha = hashlib.sha256(data).hexdigest()
                 dbfs_write_file(dst_local, data)
-                staged_info.append((src_dbfs, dst_local, status.get('file_size'), status.get('modification_time'), sha))
-        except Exception:
-            pass
+                staged_info.append((src, dst_local, status.get("file_size"), status.get("modification_time"), sha))
+                return True, None, None
+            else:
+                p = Path(src)
+                if not p.exists():
+                    raise FileNotFoundError(f"Local path does not exist: {p}")
+                data = _read_src_bytes(src)
+                if not data:
+                    raise RuntimeError("Empty read from local file.")
+                sha = hashlib.sha256(data).hexdigest()
+                Path(dst_local).parent.mkdir(parents=True, exist_ok=True)
+                Path(dst_local).write_bytes(data)
+                staged_info.append((str(p), dst_local, len(data), int(p.stat().st_mtime * 1000), sha))
+                return True, None, None
+        except Exception as e:
+            if required:
+                return False, "unreadable", f"{label or 'File'} could not be read: {src}\n{e}"
+            return True, None, None
 
-    if missing_required:
+    staged_info = []  # (src, dst_local, file_size, mtime, sha256)
+
+    # Resolve app-relative paths (so users can type "style_prompt.json" etc.)
+    excel_path = _app_path(excel_path)
+    style_prompt_path = _app_path(style_prompt_path)
+    reference_docx_path = _app_path(reference_docx_path)
+    lua_filter_path = _app_path(lua_filter_path)
+    square_filter_path = _app_path(square_filter_path)
+
+    missing_or_bad = []
+
+    ok, kind, detail = _stage_one(excel_path, EXCEL_LOCAL, required=True, label="Excel")
+    if not ok: missing_or_bad.append(detail)
+
+    ok, kind, detail = _stage_one(style_prompt_path, STYLE_PROMPT_LOCAL, required=True, label="Style prompt JSON")
+    if not ok: missing_or_bad.append(detail)
+
+    ok, kind, detail = _stage_one(reference_docx_path, REFERENCE_DOCX_LOCAL, required=True, label="Reference DOCX")
+    if not ok: missing_or_bad.append(detail)
+
+    # Lua filters are optional; pagebreak is used in the current export path, square-bracket filter is staged for future use.
+    _stage_one(lua_filter_path, LUA_FILTER_LOCAL, required=False, label="Lua pagebreak filter")
+    _stage_one(square_filter_path, SQUARE_FILTER_LOCAL, required=False, label="Lua square-bracket filter")
+
+    if missing_or_bad:
         st.error(
-            "The App identity cannot read one or more REQUIRED files from DBFS.\n\n"
-            "Missing/unreadable REQUIRED DBFS paths:\n- " + "\n- ".join(missing_required)
+            "One or more REQUIRED input files could not be staged into the App container.\n\n"
+            + "\n\n".join(missing_or_bad)
+            + "\n\n"
+            "Tip: Put the files next to app.py (or under ./assets/) and use relative paths like 'style_prompt.json'."
         )
         st.stop()
 
     if not SILENT_STAGING:
         st.success("Assets staged into App container (/tmp).")
 
-        with st.expander("Staged asset verification (DBFS → /tmp)", expanded=False):
+        with st.expander("Staged asset verification (source → /tmp)", expanded=False):
             if not staged_info:
                 st.write("No asset metadata captured.")
             else:
                 rows = []
-                for src_dbfs, dst_local, fsize, mtime, sha in staged_info:
-                    try:
-                        local_p = Path(dst_local)
-                        local_size = local_p.stat().st_size if local_p.exists() else None
-                    except Exception:
-                        local_size = None
-                    try:
-                        if mtime is None:
-                            mtime_s = ""
-                        else:
-                            mtime_s = datetime.fromtimestamp(int(mtime)/1000).strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        mtime_s = str(mtime)
-
-                    rows.append({
-                        "DBFS path": src_dbfs,
-                        "DBFS size": fsize,
-                        "DBFS modified": mtime_s,
-                        "/tmp path": dst_local,
-                        "/tmp size": local_size,
-                        "sha256": sha[:12] + "…",
-                    })
-
+                for src, dst, sz, mt, sha in staged_info:
+                    rows.append(
+                        {
+                            "Source": src,
+                            "Staged to": dst,
+                            "Bytes": sz,
+                            "Modified (ms)": mt,
+                            "SHA-256": sha,
+                        }
+                    )
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-        staged = sorted([str(p) for p in Path(LOCAL_ASSETS_DIR).glob("*")])
-        st.caption("Files currently present under /tmp staging directory:")
-        st.code("\n".join(staged) or "(no staged files?)")
-
-# =============================
-# 4) Utilities
-# =============================
-_END_PUNCT_RE = re.compile(r"[.!?]['\"\)\]]?\s*$")
 
 def _trim_to_last_complete_sentence(paragraph: str) -> str:
     """
@@ -1022,6 +1092,53 @@ def build_row_paragraph_prompt(uid: str, card: dict) -> list:
         },
     ]
 
+
+def generate_row_paragraph(effective_system_text: str, card: dict, uid: str = None) -> str:
+    """
+    Generate one narrative paragraph for a single activity row/card.
+
+    This is intentionally a thin wrapper around:
+      - build_row_paragraph_prompt(...)
+      - call_fmapi(...)
+      - extract_text(...)
+
+    It exists because the UI loop calls generate_row_paragraph(...) directly.
+    """
+    # Resolve UID if not explicitly provided
+    if uid is None:
+        uid = (card.get("UID") or card.get("uid") or card.get("Uid") or "").strip()
+    if not uid:
+        # Fall back to a deterministic placeholder to avoid hard crashes
+        uid = "UNKNOWN_UID"
+
+    messages = build_row_paragraph_prompt(uid, card)
+
+    # If we have an effective system prompt, override the system message
+    eff = (effective_system_text or "").strip()
+    if eff:
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            messages[0]["content"] = eff
+        else:
+            messages = [{"role": "system", "content": eff}] + messages
+
+    resp = call_fmapi(
+        ENDPOINT,
+        messages=messages,
+        max_tokens=ROW_MAX_TOKENS,
+        temperature=ROW_TEMP,
+        retries=2,
+    )
+    para = extract_text(resp).strip()
+
+    # Ensure it's a single paragraph (no blank lines)
+    para = re.sub(r"\n\s*\n+", " ", para).strip()
+
+    # Safety: ensure terminal punctuation
+    if para and para[-1] not in ".!?":
+        para += "."
+
+    return para
+
 def split_pmids(s):
     """Return candidate PMIDs (7–9 digits) from a string."""
     if not s or s == "—":
@@ -1062,7 +1179,7 @@ def _summary_meets_shape(md: str, min_paras: int, min_words: int, target_max: in
 
 def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str, str, str]:
     """
-    Convert per-paragraph UID markers [^UID] into occurrence-based numeric footnotes,
+    Convert UID markers [^UID] into stable numeric footnotes (deduplicated per UID),
     and build a References section that lists EVERY footnote source in the SAME order.
     """
     UID_MARK_RE = re.compile(r"\[\^\s*([A-Za-z0-9._-]+)\s*\]")
@@ -1268,6 +1385,7 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
     out_parts: list[str] = []
     last = 0
     fn_counter = 0
+    uid_to_fn: dict[str, tuple[int, str]] = {}  # uid -> (num, fn_label)
 
     for m in UID_MARK_RE.finditer(md_clean):
         uid = m.group(1)
@@ -1278,14 +1396,16 @@ def build_footnotes_from_uid_markers(md_text: str, uid_index: dict) -> tuple[str
         if uid not in known_uids:
             continue
 
-        fn_counter += 1
-        fn_label = f"fn{fn_counter}"
+        if uid not in uid_to_fn:
+            fn_counter += 1
+            fn_label = f"fn{fn_counter}"
+            ref_text = _make_ref_text(uid).strip()
+            uid_to_fn[uid] = (fn_counter, fn_label)
 
-        ref_text = _make_ref_text(uid).strip()
+            footnotes.append((fn_label, ref_text))
+            references_lines.append(f"{fn_counter} {ref_text}")
 
-        footnotes.append((fn_label, ref_text))
-        references_lines.append(f"{fn_counter} {ref_text}")
-
+        _, fn_label = uid_to_fn[uid]
         out_parts.append(f"[^{fn_label}]")
 
     out_parts.append(md_clean[last:])
@@ -1432,6 +1552,120 @@ def _extract_explicit_acronyms_from_cards(cards: list | None) -> dict:
 
     return out
 
+
+def _extract_pmids_from_cards(cards: list | None, max_pmids: int = 80) -> list[str]:
+    """Collect PMIDs from cards for PubMed-based acronym expansion inference."""
+    if not cards:
+        return []
+    out: list[str] = []
+    seen = set()
+    for c in cards:
+        for k in ("PMID(s)", "PMID", "PMIDs", "PubMed ID", "PubMed IDs"):
+            raw = c.get(k)
+            if raw is None:
+                continue
+            for p in re.findall(r"\b(\d{7,9})\b", str(raw)):
+                if p not in seen:
+                    seen.add(p)
+                    out.append(p)
+                    if len(out) >= max_pmids:
+                        return out
+    return out
+
+
+@lru_cache(maxsize=2048)
+def _pmid_to_pubmed_text(pmid: str) -> str:
+    """
+    Fetch Title + Abstract text for a PMID via NCBI E-utilities (PubMed XML).
+    Returns an empty string if anything fails.
+    """
+    pmid = (pmid or "").strip()
+    if not pmid:
+        return ""
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    params = {"db": "pubmed", "id": pmid, "retmode": "xml"}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+    except Exception:
+        return ""
+
+    try:
+        root = ET.fromstring(r.text)
+    except Exception:
+        return ""
+
+    art = root.find(".//PubmedArticle")
+    if art is None:
+        return ""
+
+    title_node = art.find(".//ArticleTitle")
+    title = "".join(title_node.itertext()).strip() if title_node is not None else ""
+    # Abstract may have multiple AbstractText nodes
+    abst_parts = []
+    for a in art.findall(".//Abstract/AbstractText"):
+        abst_parts.append("".join(a.itertext()))
+    abstract = " ".join([p.strip() for p in abst_parts if p and p.strip()])
+
+    blob = " ".join([str(title).strip(), str(abstract).strip()]).strip()
+    return re.sub(r"\s+", " ", blob)
+
+
+def expand_acronyms_from_pubmed(acronyms: list[str], pmids: list[str]) -> dict:
+    """
+    Infer acronym expansions by mining Title/Abstract text from PubMed articles
+    (NLM/NCBI source) for patterns like:
+      - 'long form (ACR)'
+      - 'ACR (long form)'
+
+    We only use the PMIDs already present in the dataset/cards (to keep it relevant).
+    """
+    acronyms = [a for a in (acronyms or []) if a and re.fullmatch(r"[A-Z0-9]{2,10}(?:-[A-Z0-9]{2,10})?", a)]
+    acronyms = sorted(set(acronyms))
+    if not acronyms or not pmids:
+        return {}
+
+    # Limit network work
+    pmids = [p for p in pmids if p and re.fullmatch(r"\d{7,9}", str(p).strip())]
+    pmids = pmids[:50]
+
+    # Pre-fetch blobs
+    blobs = []
+    for p in pmids:
+        t = _pmid_to_pubmed_text(str(p))
+        if t:
+            blobs.append(t)
+
+    if not blobs:
+        return {}
+
+    # Build candidate expansions per acronym
+    best: dict[str, str] = {}
+    for acr in acronyms:
+        # Capture 4–80 chars of words/spaces/hyphens before/after
+        # Example: "Childhood Cancer Data Initiative (CCDI)"
+        # Example: "CCDI (Childhood Cancer Data Initiative)"
+        re_after = re.compile(rf"\b{re.escape(acr)}\s*\(\s*([A-Za-z][A-Za-z0-9\-/,&' ]{{4,80}}?)\s*\)")
+        re_before = re.compile(rf"\b([A-Za-z][A-Za-z0-9\-/,&' ]{{4,80}}?)\s*\(\s*{re.escape(acr)}\s*\)")
+
+        counts: dict[str, int] = {}
+        for blob in blobs:
+            for m in re_before.finditer(blob):
+                cand = re.sub(r"\s+", " ", m.group(1)).strip(" .;:,")
+                if _validate_acronym_expansion(acr, cand):
+                    counts[cand] = counts.get(cand, 0) + 1
+            for m in re_after.finditer(blob):
+                cand = re.sub(r"\s+", " ", m.group(1)).strip(" .;:,")
+                if _validate_acronym_expansion(acr, cand):
+                    counts[cand] = counts.get(cand, 0) + 1
+
+        if counts:
+            # Deterministic tie-break: highest frequency, then shortest, then alpha
+            best_cand = sorted(counts.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0].lower()))[0][0]
+            best[acr] = best_cand
+
+    return best
+
 def build_acronyms_section(md_text: str, cards: list | None = None, system_text: str | None = None) -> str:
     md_text = md_text or ""
 
@@ -1459,13 +1693,21 @@ def build_acronyms_section(md_text: str, cards: list | None = None, system_text:
             exp = (_ACRONYM_EXPANSIONS.get(acr, "") or "").strip()
         if not exp:
             missing.append(acr)
+    pubmed_map = {}
+    if missing:
+        try:
+            pmids = _extract_pmids_from_cards(cards)
+            pubmed_map = expand_acronyms_from_pubmed(missing, pmids)
+        except Exception:
+            pubmed_map = {}
 
     llm_map = {}
-    if missing:
+    remaining = [a for a in missing if not (pubmed_map.get(a) or "").strip()]
+    if remaining:
         try:
             llm_map = expand_acronyms_with_llm(
                 system_text=system_text_base if "system_text_base" in globals() else "You write NIH triennial report narrative text.",
-                acronyms=missing,
+                acronyms=remaining,
                 context_text=md_text,
                 max_tokens=450,
             )
@@ -1478,8 +1720,11 @@ def build_acronyms_section(md_text: str, cards: list | None = None, system_text:
         if not exp:
             exp = (_ACRONYM_EXPANSIONS.get(acr, "") or "").strip()
         if not exp:
+            exp = (pubmed_map.get(acr) or "").strip()
+        if not exp:
             exp = (llm_map.get(acr) or "").strip()
 
+        # Remove low-quality placeholders
         if exp:
             exp_norm = exp.strip().strip(".")
             if exp_norm.lower() == acr.strip().lower():
@@ -1487,12 +1732,13 @@ def build_acronyms_section(md_text: str, cards: list | None = None, system_text:
             elif exp_norm.lower() in {"expansion not specified", "not specified", "unknown", "n/a"}:
                 exp = ""
 
+        # If we still can't infer an expansion, omit the acronym rather than printing a placeholder.
         if not exp:
-            exp = "Expansion not specified"
+            continue
 
-        lines.append(f"**{acr}** — {exp}")
-
+        lines.append(f"**{acr}** — {exp.strip().strip('.')}")
     return "\n\n".join(lines).strip()
+
 
 
 def _validate_acronym_expansion(acr: str, exp: str) -> bool:
@@ -1639,6 +1885,21 @@ def load_system_text(style_prompt_path_local: str) -> str:
     return "\n".join(content) if isinstance(content, list) else str(content)
 
 
+def build_effective_system_text(system_text_base: str, style_override: str) -> str:
+    """
+    Combine the base system prompt from style_prompt.json with an optional per-run override.
+
+    The override must NEVER leak internal implementation details into the user-visible plan.
+    This function only concatenates text; downstream code is responsible for scrub/filters.
+    """
+    base = (system_text_base or "").strip()
+    override = (style_override or "").strip()
+    if not override:
+        return base
+    # Keep formatting predictable for model + routing heuristics.
+    return (base + "\n\n" if base else "") + "Run-specific style override:\n" + override
+
+
 @st.cache_data(show_spinner=False)
 def load_excel(excel_path_local: str) -> pd.DataFrame:
     p = Path(excel_path_local)
@@ -1654,6 +1915,18 @@ def resolve_column(df: pd.DataFrame, col_name: str) -> str:
         return col_name
     lc = {c.lower(): c for c in df.columns}
     return lc.get(col_name.lower(), col_name)
+
+def resolve_any_column(df: pd.DataFrame, candidates: list[str], fallback: str) -> str:
+    """Return the first candidate column that exists (case-insensitive), else fallback."""
+    cols = list(df.columns)
+    lc = {str(c).strip().lower(): str(c).strip() for c in cols}
+    for cand in candidates:
+        if cand in cols:
+            return cand
+        hit = lc.get(str(cand).strip().lower())
+        if hit:
+            return hit
+    return resolve_column(df, fallback)
 
 
 def dropdown_values(df: pd.DataFrame, col: str) -> list[str]:
@@ -1804,10 +2077,29 @@ PLAN_MAX_TOKENS = 650
 PLAN_TEMP = 0.2
 
 PLAN_SYSTEM = (
-    "You are a planning assistant for a triennial report generator.\n"
-    "Output a short, clear preview in numbered steps.\n"
-    "No code. No URLs. No markdown headings.\n"
+    "You are a planning assistant for a triennial report generator.\\n"
+    "Output a short, clear preview in numbered steps.\\n"
+    "Do NOT mention Pandoc, pypandoc, or any document-conversion tooling.\\n"
+    "Do NOT mention internal implementation details (paths, binaries, libraries, or deployment specifics).\\n"
+    "No code. No URLs. No markdown headings.\\n"
 )
+
+
+def _scrub_plan_preview_text(text: str) -> str:
+    """Remove any Pandoc/tooling mentions from LLM plan previews (client requirement)."""
+    if not text:
+        return text
+    lines = text.splitlines()
+    cleaned = []
+    for ln in lines:
+        if re.search(r"\b(pandoc|pypandoc)\b", ln, flags=re.IGNORECASE):
+            continue
+        cleaned.append(ln)
+    out = "\n".join(cleaned).strip()
+    # If the model inlined the word mid-sentence, scrub it safely.
+    out = re.sub(r"\b(pandoc|pypandoc)\b", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s{2,}", " ", out)
+    return out
 
 
 def generate_plan(field_value: str, uid_list: list[str], counts: dict, style_override: str) -> str:
@@ -1827,7 +2119,7 @@ def generate_plan(field_value: str, uid_list: list[str], counts: dict, style_ove
             "Generate section syntheses",
             "Assemble markdown",
             "Convert UID markers to numeric footnotes",
-            "Pandoc to DOCX",
+            "Render the final report document",
             "Optional: apply DOCX primary color override",
             "Publish to DBFS FileStore and offer download",
         ],
@@ -1837,7 +2129,7 @@ def generate_plan(field_value: str, uid_list: list[str], counts: dict, style_ove
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
     resp = call_fmapi(ENDPOINT, messages=messages, max_tokens=PLAN_MAX_TOKENS, temperature=PLAN_TEMP)
-    return extract_text(resp)
+    return _scrub_plan_preview_text(extract_text(resp))
 
 
 # =============================
@@ -1851,73 +2143,106 @@ def make_card(row, cmap: dict) -> dict:
     return card
 
 
-def enforce_single_uid_marker(paragraph: str, uid: str) -> str:
+def _split_sentences_preserve(text: str):
     """
-    Ensures exactly one UID footnote marker at the end of the paragraph, formatted as .[^UID] (no space).
+    Pragmatic sentence splitter that preserves delimiters/spaces.
+    Works with citation markers placed right after punctuation, e.g. "Sentence.[^UID] Next..."
+    """
+    if not text:
+        return []
+    sent_end = r'(?:[\.!\?](?:\[\^[^\]]+\])*(?:["\')\]\}]+)?)'
+    return re.findall(rf'.*?{sent_end}(?:\s+|$)|.+$', text, flags=re.S)
+
+
+def collapse_consecutive_citation_runs(paragraph: str) -> str:
+    """
+    Collapse consecutive/cascading citations that refer to the same reference set.
+
+    - Footnote markers look like: [^UID]
+    - If consecutive sentences carry the same marker set, keep ONE marker set at the end
+      of the last sentence in that run.
+    - If a sentence has NO markers, it breaks the run.
+    - If marker sets change, close the previous run at the previous sentence end.
     """
     txt = (paragraph or "").strip()
-    txt = re.sub(r"\s+", " ", txt).strip()
-    txt = re.sub(r"\[\^\s*[A-Za-z0-9._-]+\s*\]", "", txt).strip()
+    if not txt:
+        return txt
 
-    if txt.endswith((";", ":")):
-        txt = txt[:-1].rstrip()
-    if not txt.endswith("."):
-        txt += "."
+    chunks = _split_sentences_preserve(txt)
 
-    txt += f"[^{uid}]"
-    return txt
+    marker_re = re.compile(r'\[\^([^\]]+)\]')
+
+    def _extract_and_strip(chunk: str):
+        markers = marker_re.findall(chunk)
+        seen = set()
+        markers_norm = tuple([m for m in markers if not (m in seen or seen.add(m))])
+        body = marker_re.sub("", chunk)
+        return body, markers_norm
+
+    def _append_markers_preserve_space(body: str, markers):
+        if not markers:
+            return body
+        m = re.search(r'(\s*)$', body)
+        trail = m.group(1) if m else ""
+        core = body[:-len(trail)] if trail else body
+        return core + "".join([f"[^{x}]" for x in markers]) + trail
+
+    out = []
+    prev_body = None
+    prev_markers = None
+
+    for chunk in chunks:
+        body, markers_norm = _extract_and_strip(chunk)
+        markers_norm = markers_norm if markers_norm else None
+
+        if prev_body is None:
+            prev_body, prev_markers = body, markers_norm
+            continue
+
+        if markers_norm and prev_markers and markers_norm == prev_markers:
+            # Continue run: emit previous sentence WITHOUT markers; carry markers to the end of the run
+            out.append(prev_body)
+            prev_body = body
+            continue
+
+        # Close previous run
+        if prev_markers:
+            prev_body = _append_markers_preserve_space(prev_body, prev_markers)
+        out.append(prev_body)
+
+        # Start new run
+        prev_body, prev_markers = body, markers_norm
+
+    # Flush last sentence
+    if prev_body is not None:
+        if prev_markers:
+            prev_body = _append_markers_preserve_space(prev_body, prev_markers)
+        out.append(prev_body)
+
+    joined = "".join(out)
+    joined = re.sub(r'[ \t]{2,}', ' ', joined)
+    return joined.strip()
 
 
-def row_facts(card):
-    return {
-        "Submitting ICO": card.get("Submitting ICO", "—"),
-        "Lead ICO": card.get("Lead ICO", "—"),
-        "Collaborating ICOs/Agencies/Orgs": card.get("Collaborating ICOs/Agencies/Orgs", "—"),
-        "Activity Name": card.get("Activity Name", "—"),
-        "Activity Description": card.get("Activity Description", "—"),
-        "Unique ID": card.get("Unique ID", "—"),
-    }
-
-
-def build_effective_system_text(base_system_text: str, style_override: str) -> str:
-    """Compose the system prompt, with optional run-specific override.
-
-    Client rule: do not expand acronyms in narrative text (especially CI/CIs).
+def enforce_uid_markers_after_each_sentence(paragraph: str, uid: str) -> str:
     """
-    system_text = (base_system_text or "").rstrip()
+    Ensure the paragraph is citeable while also collapsing consecutive same-reference runs.
 
-    # Always enforce no-acronym-expansion instruction at the system level.
-    if "NO_ACRONYM_EXPANSION_INSTRUCTION" in globals():
-        system_text = system_text + "\n\n" + NO_ACRONYM_EXPANSION_INSTRUCTION
+    - If the paragraph has NO markers at all, append [^<UID>] once at the end.
+    - If the paragraph already has markers (including multiple references), do not
+      overwrite them; just collapse consecutive runs.
+    """
+    txt = (paragraph or "").strip()
+    if not txt:
+        return txt
 
-    o = (style_override or "").strip()
-    if o:
-        system_text = system_text + "\n\n" + "User override for THIS RUN:\n" + o + "\n"
+    if "[^" not in txt:
+        if not re.search(r'[.!?]["\')\]]?\s*$', txt):
+            txt = txt.rstrip() + "."
+        txt = txt.rstrip() + f" [^{uid}]"
 
-    return system_text
+    return collapse_consecutive_citation_runs(txt)
 
-
-
-def generate_row_paragraph(system_text: str, card: dict) -> str:
-    uid = card.get("Unique ID", "—")
-    instr = (
-        "- Using ONLY these fields, write a 3–5 sentence paragraph in NIH house style.\n"
-        "- Do NOT start the paragraph with 'Researchers', 'Scientists', or institute-first phrasing.\n"
-        "- Begin with the scientific contribution, method, or outcome.\n"
-        "- Include: Submitting ICO, Lead ICO, Collaborators, Activity Name, and the essence of Activity Description.\n"
-        "- Do NOT include Activity Type or Importance explicitly.\n"
-        "- Do NOT include any URLs, PMIDs, tables, lists, JSON, code fences, or metadata. Output pure prose only.\n"
-        "- Append a single UID superscript marker for this row at the VERY END of the paragraph, formatted as [^<UID>].\n"
-    )
-    user = {"role": "user", "content": instr + "\n" + json.dumps(row_facts(card), ensure_ascii=False)}
-    resp = call_fmapi(
-        ENDPOINT,
-        messages=[{"role": "system", "content": system_text}, user],
-        max_tokens=MAX_TOKENS_ROW,
-        temperature=TEMPERATURE,
-    )
-    txt = hard_clean_generated_text(extract_text(resp))
-    return enforce_single_uid_marker(txt, uid)
 
 
 def top_participating_ics(cards, k=8):
@@ -2380,50 +2705,50 @@ def assemble_markdown(
 
 
 def ensure_pandoc() -> str:
+    """
+    Resolve pandoc WITHOUT any runtime downloads.
+
+    Resolution order:
+      1) pandoc on PATH
+      2) pypandoc-binary bundled pandoc (installed at build time via pip)
+      3) $PANDOC_PATH (only if it points to a real runtime filesystem path)
+      4) /tmp/pandoc/bin/pandoc (legacy if your image bakes it there)
+    """
+    import os
+    import shutil
+    from pathlib import Path
+
+    # 1) PATH
     existing = shutil.which("pandoc")
     if existing:
         return existing
 
-    pandoc = Path("/tmp/pandoc/bin/pandoc")
-    if pandoc.exists():
-        return str(pandoc)
-
-    install_sh = r"""
-set -euo pipefail
-PVER="3.3"
-WORKDIR="/tmp/pandoc"
-mkdir -p "$WORKDIR"
-cd "$WORKDIR"
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl not found" >&2
-  exit 90
-fi
-curl -L -o pandoc.tgz "https://github.com/jgm/pandoc/releases/download/${PVER}/pandoc-${PVER}-linux-amd64.tar.gz"
-tar -xzf pandoc.tgz
-mkdir -p "$WORKDIR/bin"
-cp "pandoc-${PVER}/bin/pandoc" "$WORKDIR/bin/pandoc"
-chmod +x "$WORKDIR/bin/pandoc"
-"""
+    # 2) pypandoc-binary (bundled pandoc, no runtime download)
     try:
-        subprocess.run(["bash", "-lc", install_sh], check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            "Pandoc is required to export DOCX but was not found on PATH, and the App could not download it.\n\n"
-            "Likely causes:\n"
-            "- Outbound internet is blocked from the Databricks Apps container, or\n"
-            "- curl is not installed in the image.\n\n"
-            "Recommended fixes:\n"
-            "1) Bake pandoc into the App image, or\n"
-            "2) Configure the environment so pandoc is on PATH, or\n"
-            "3) Allow outbound access to GitHub for the App container.\n\n"
-            f"Download attempt output:\nSTDOUT:\n{e.stdout or '(empty)'}\n\nSTDERR:\n{e.stderr or '(empty)'}"
-        )
+        import pypandoc  # type: ignore
+        p = pypandoc.get_pandoc_path()
+        if p and Path(p).exists():
+            return str(Path(p).resolve())
+    except Exception:
+        pass
 
-    pandoc_bin = Path("/tmp/pandoc/bin/pandoc")
-    if not pandoc_bin.exists():
-        raise RuntimeError("Pandoc installation failed: /tmp/pandoc/bin/pandoc was not created.")
-    return str(pandoc_bin)
+    # 3) Explicit override
+    env_path = os.environ.get("PANDOC_PATH", "").strip()
+    if env_path:
+        p = Path(env_path)
+        if p.exists() and p.is_file():
+            return str(p.resolve())
 
+    # 4) Legacy baked path
+    legacy = Path("/tmp/pandoc/bin/pandoc")
+    if legacy.exists() and legacy.is_file():
+        return str(legacy)
+
+    raise RuntimeError(
+        "Pandoc is required to export DOCX, but it was not found.\n\n"
+        "Fix (recommended for Databricks Apps): add pypandoc + pypandoc-binary to requirements.txt "
+        "so pandoc is bundled at build time.\n"
+    )
 
 def export_docx(md_text: str, out_dir: str, field_value: str, lua_pagebreak_enabled: bool, square_brackets_enabled: bool) -> str:
     pandoc = ensure_pandoc()
@@ -2440,8 +2765,9 @@ def export_docx(md_text: str, out_dir: str, field_value: str, lua_pagebreak_enab
     md_path = str(Path(out_dir) / "report.md")
     Path(md_path).write_text(md_text, encoding="utf-8")
 
+    # env = os.environ.copy()
+    # env["PATH"] = f"/tmp/pandoc/bin:{env.get('PATH', '')}"
     env = os.environ.copy()
-    env["PATH"] = f"/tmp/pandoc/bin:{env.get('PATH', '')}"
 
     cmd = [
         pandoc, md_path,
@@ -2457,6 +2783,10 @@ def export_docx(md_text: str, out_dir: str, field_value: str, lua_pagebreak_enab
 
     if lua_pagebreak_enabled and Path(LUA_FILTER_LOCAL).exists():
         cmd += ["--lua-filter", LUA_FILTER_LOCAL]
+
+
+    if square_brackets_enabled and Path(SQUARE_FILTER_LOCAL).exists():
+        cmd += ["--lua-filter", SQUARE_FILTER_LOCAL]
 
     p = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if p.returncode != 0:
@@ -2518,30 +2848,37 @@ with st.expander("Inputs", expanded=True):
     c1, c2 = st.columns(2)
 
     with c1:
-        excel_dbfs = st.text_input("Excel (DBFS path)", value=DEFAULT_EXCEL_DBFS)
-        style_prompt_dbfs = st.text_input("Style prompt (DBFS path)", value=DEFAULT_STYLE_PROMPT_DBFS)
-        reference_docx_dbfs = st.text_input("Reference DOCX (DBFS path)", value=DEFAULT_REFERENCE_DOCX_DBFS)
+        excel_path = st.text_input("Excel (app/local path)", value=DEFAULT_EXCEL_PATH)
+        style_prompt_path = st.text_input("Style prompt JSON (app/local path)", value=DEFAULT_STYLE_PROMPT_PATH)
+        reference_docx_path = st.text_input("Reference DOCX (app/local path)", value=DEFAULT_REFERENCE_DOCX_PATH)
+        lua_filter_path = st.text_input("Lua pagebreak filter (app/local path, optional)", value=DEFAULT_LUA_FILTER_PATH)
+        square_filter_path = st.text_input("Lua square-bracket filter (app/local path, optional)", value=DEFAULT_SQUARE_FILTER_PATH)
 
     with c2:
-        working_out_dbfs = st.text_input("Working output dir (DBFS path)", value=DEFAULT_WORKING_OUT_DBFS)
+        # DBFS publish is optional; Streamlit's download button works without DBFS
+        publish_to_dbfs = st.checkbox("Publish a copy to DBFS FileStore (optional)", value=False)
+        working_out_dbfs = st.text_input("Working output dir (DBFS path)", value=DEFAULT_WORKING_OUT_DBFS, disabled=not publish_to_dbfs)
+
         volume_out_dir = st.text_input("Final output volume dir (optional)", value=DEFAULT_VOLUME_OUT_DIR)
         copy_to_volume = st.checkbox("Also copy final DOCX into Volume directory", value=False)
 
     use_lua_filter = True
     use_square_bracket_filter = False
-    st.caption("Tip: After changing inputs, click 'Load Inputs' to restage files and refresh dropdown values.")
+    st.caption("Tip: Put the input files next to app.py (or under ./assets/) and keep these as relative names (e.g., 'style_prompt.json').")
     load_inputs = st.button("Load Inputs")
+
 
 if "inputs_loaded" not in st.session_state:
     st.session_state.inputs_loaded = False
 
 if load_inputs or not st.session_state.inputs_loaded:
-    with st.spinner("Loading inputs (staging DBFS files)…"):
+    with st.spinner("Loading inputs (staging local/app files)…"):
         stage_assets_or_stop(
-            excel_dbfs=excel_dbfs.strip(),
-            style_prompt_dbfs=style_prompt_dbfs.strip(),
-            reference_docx_dbfs=reference_docx_dbfs.strip(),
-            lua_filter_dbfs=DEFAULT_LUA_FILTER_DBFS,
+            excel_path=excel_path.strip(),
+            style_prompt_path=style_prompt_path.strip(),
+            reference_docx_path=reference_docx_path.strip(),
+            lua_filter_path=lua_filter_path.strip(),
+            square_filter_path=square_filter_path.strip(),
         )
         try:
             load_excel.clear()
@@ -2553,7 +2890,7 @@ if load_inputs or not st.session_state.inputs_loaded:
 system_text_base = load_system_text(STYLE_PROMPT_LOCAL)
 df = load_excel(EXCEL_LOCAL)
 
-field_col = resolve_column(df, FIELD_COL)
+field_col = resolve_any_column(df, ["Field", "Field Type", "FieldType", "field", "field_type"], fallback="Field")
 
 # =============================
 # 9.1) Field dropdown (Activity Type filter removed)
@@ -2662,7 +2999,7 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
                     style_override=style_override,
                 )
 
-            st.subheader("preview (LLM-generated)")
+            st.subheader("Preview (LLM-generated)")
             st.write(plan_txt)
 
             # --- Section inclusion + rationale preview (requires user confirmation) ---
@@ -2742,7 +3079,7 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
         st.caption("First UIDs (up to 30):")
         st.code(", ".join(_uids[:30]) if _uids else "(none)")
 
-        st.subheader("preview (LLM-generated)")
+        st.subheader("Preview (LLM-generated)")
         st.write(_plan_txt)
 
         _included_sections = st.session_state.get("included_sections") or st.session_state.get("plan_sections") or []
@@ -2836,14 +3173,14 @@ if generate:
     effective_system_text = build_effective_system_text(system_text_base, style_override)
 
     if persist_style_override and style_override.strip():
+        # Portability: persist the override only in the *local staged* style prompt for this run.
+        # (The app source folder is typically read-only in Databricks Apps, and the client may not use DBFS.)
         try:
-            write_style_prompt_to_dbfs(style_prompt_dbfs.strip(), effective_system_text)
-            data = dbfs_read_all(style_prompt_dbfs.strip())
-            if data:
-                dbfs_write_file(STYLE_PROMPT_LOCAL, data)
-            st.success("style_prompt.json updated in DBFS and re-staged for this run.")
+            payload_obj = {"content": effective_system_text}
+            Path(STYLE_PROMPT_LOCAL).write_text(json.dumps(payload_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+            st.success("style_prompt.json updated locally for this run.")
         except Exception as e:
-            st.warning(f"Could not update style_prompt.json in DBFS (continuing without persisting): {e}")
+            st.warning(f"Could not update local style_prompt.json (continuing without persisting): {e}")
 
 
     def parse_hex_color(s: str) -> Optional[Tuple[int, int, int]]:
@@ -3065,8 +3402,11 @@ if generate:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
-        full_url = f"{get_workspace_host()}{url}"
-        st.caption(url)
+        if url:
+            full_url = f"{get_workspace_host()}{url}"
+            st.caption(url)
+        else:
+            st.caption("DBFS publish disabled (download using the button above).")
 
         # NOTE: UID routing rationale is intentionally shown during **Build Plan** (preflight),
         # not after generation. This keeps the post-generation UI focused on download + diagnostics.
