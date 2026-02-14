@@ -517,6 +517,92 @@ def normalize_uid_marker_placement(text: str) -> str:
     text = re.sub(r"(\[\^\s*[A-Za-z0-9._-]+\s*\])([.,;:])", r"\2\1", text)
     return text
 
+def add_uid_marker_per_sentence(text: str, uid: str) -> str:
+    """
+    Place the UID footnote marker at the end of EACH sentence (not just paragraph end).
+
+    Rules:
+      - Strip any existing [^...] markers first (we re-insert deterministically).
+      - Protect common abbreviations and initialisms so we don't treat their periods as sentence boundaries.
+      - Insert [^<uid>] immediately after sentence-ending punctuation (.!?).
+    """
+    import re
+
+    if not text:
+        return text
+
+    # Remove any existing footnote markers first
+    s = re.sub(r"\[\^\s*[A-Za-z0-9._-]+\s*\]", "", text).strip()
+
+    # Token used to protect periods that are NOT sentence boundaries
+    DOT = "∯"
+
+    # Protect common abbreviations (extend as needed)
+    abbrevs = [
+        "e.g.", "i.e.", "etc.", "vs.", "Dr.", "Mr.", "Ms.", "Mrs.", "Prof.", "Sr.", "Jr.",
+        "Fig.", "No.", "St.", "a.m.", "p.m."
+    ]
+    for a in abbrevs:
+        s = s.replace(a, a.replace(".", DOT))
+
+    # Protect initialisms like U.S., U.K., N.I.H., etc.
+    def _protect_initialisms(m):
+        return m.group(0).replace(".", DOT)
+    s = re.sub(r"\b(?:[A-Z]\.){2,}", _protect_initialisms, s)
+
+    # Insert marker after sentence-ending punctuation.
+    # Handles optional closing quotes/brackets before whitespace/end.
+    def _ins(m):
+        punct = m.group(1)
+        tail = m.group(2) or ""
+        return f"{punct}[^{uid}]{tail}"
+
+    s = re.sub(r"([.!?])([\"'\)\]\}]*)(\s+|$)", lambda m: _ins(m) if m.group(3) is not None else m.group(0), s)
+
+    # Restore protected periods
+    s = s.replace(DOT, ".")
+
+    return s
+
+
+def apply_uid_markers_from_cite_tokens(text: str, uid: str, token: str = "[[CITE]]") -> str:
+    """Apply UID markers ONLY where the model indicated direct support.
+
+    The model is instructed to append `[[CITE]]` to sentences that are directly supported
+    by the activity brief. We convert those tokens into the UID footnote marker.
+
+    Behavior:
+      - Strip any existing [^...] markers first (deterministic reinsertion).
+      - Replace `[[CITE]]` tokens with `[^<uid>]`, preserving punctuation order.
+      - If NO token appears, leave the paragraph uncited (no paragraph-end fallback).
+    """
+    import re
+
+    if not text:
+        return text
+
+    s = re.sub(r"\[\^\s*[A-Za-z0-9._-]+\s*\]", "", text).strip()
+
+    # Replace token patterns near punctuation/whitespace
+    # e.g., "sentence.[[CITE]]" or "sentence. [[CITE]]"
+    token_re = re.escape(token)
+
+    # Count tokens before replacement (audit)
+    n_tokens = len(re.findall(token_re, s))
+
+    # Normalize ".[[CITE]]" -> ".[^UID]" and " [[CITE]]" -> "[^UID]"
+    s = re.sub(rf"([.!?])\s*{token_re}", rf"\1[^{uid}]", s)
+    s = re.sub(rf"\s*{token_re}", rf"[^{uid}]", s)
+
+    # Remove any leftover token text (if model altered it slightly)
+    s = s.replace(token, "").strip()
+
+    if n_tokens == 0:
+        # Client requirement: do NOT add paragraph-end citations when the model did not mark a sentence as supported.
+        return s
+
+    return s
+
 def strip_raw_uid_tokens(text: str) -> str:
     """
     Remove raw UID tokens (e.g., '378_NIAID', '697_NHLBI') from narrative prose.
@@ -1088,7 +1174,8 @@ def build_row_paragraph_prompt(uid: str, card: dict) -> list:
             "- Name the lead institute only once if needed.\n"
             "- Do not include inline URLs or empty brackets.\n"
             "- End with a complete sentence.\n"
-            "\nACTIVITY BRIEF:\n" + brief
+            "- IMPORTANT (citation control): Append the token [[CITE]] at the end of ONLY those sentences that are directly supported by the activity brief. Do NOT add [[CITE]] to bridging/general context sentences.\n"
+            + "\nACTIVITY BRIEF:\n" + brief
         },
     ]
 
@@ -2521,6 +2608,48 @@ def llm_route_uid_to_single_section(system_text: str, uid: str, card: dict, cand
         return selected, rationale, excluded
 
 
+def enforce_single_section_per_uid(section_to_uids_raw: dict, uid_routing: dict, *, on_conflict: str = "keep_first") -> tuple[dict, dict]:
+    """
+    Enforce that each UID belongs to EXACTLY ONE section globally.
+
+    Inputs:
+      - section_to_uids_raw: {section: [uids]}
+      - uid_routing: {uid: {"selected_section": ..., ...}}
+
+    Behavior:
+      - If a UID is found in multiple sections, we either:
+          * keep_first: keep the first assignment and drop subsequent duplicates
+          * raise: raise ValueError
+
+    Returns:
+      - (section_to_uids, uid_routing) normalized so each UID appears in one section only.
+    """
+    from collections import OrderedDict
+
+    # Preserve SECTION_ORDER ordering
+    normalized = {sec: [] for sec in SECTION_ORDER}
+
+    seen = OrderedDict()  # uid -> section (first wins)
+    conflicts = {}
+
+    for sec in SECTION_ORDER:
+        for uid in (section_to_uids_raw.get(sec) or []):
+            if uid not in seen:
+                seen[uid] = sec
+                normalized[sec].append(uid)
+            else:
+                conflicts.setdefault(uid, set()).update({seen[uid], sec})
+                if on_conflict == "raise":
+                    raise ValueError(f"UID '{uid}' assigned to multiple sections: {sorted(conflicts[uid])}")
+                # keep_first: silently drop uid from this later section
+
+    # Ensure uid_routing matches the normalized assignment (first wins)
+    for uid, sec in seen.items():
+        if uid in uid_routing:
+            uid_routing[uid]["selected_section"] = sec
+
+    return normalized, uid_routing
+
 def route_all_uids(system_text: str, uid_index: dict) -> tuple[dict, dict]:
     """
     Builds:
@@ -2540,10 +2669,10 @@ def route_all_uids(system_text: str, uid_index: dict) -> tuple[dict, dict]:
             "excluded_sections": excluded,
             "candidates": [c for c in candidates if c in SECTION_ORDER],
         }
+    # Hard guard: make it impossible for a UID to exist in multiple sections
+    section_to_uids, uid_routing = enforce_single_section_per_uid(section_to_uids, uid_routing, on_conflict="keep_first")
 
     return section_to_uids, uid_routing
-
-
 def section_synthesis(system_text: str, section_name: str, uids: list[str], uid_index: dict):
     instr = (
             "- Write one or two cohesive synthesis paragraphs for the section title below.\n"
@@ -2668,7 +2797,6 @@ def assemble_markdown(
             para = re.sub(r"\s+([\.,;:!?])", r"\1", para)
             para = strip_raw_uid_tokens(para)
             para = postprocess_narrative(para)
-
             # Client requirement: keep Entry numbers, but never as citation-like text at paragraph end
             para = re.sub(r"\(\s*Entry\s+\d+\s*\)", "", para, flags=re.IGNORECASE)
             para = re.sub(r"\bEntry\s+\d+\b", "", para, flags=re.IGNORECASE)
@@ -2683,7 +2811,9 @@ def assemble_markdown(
             if not para.endswith("."):
                 para += "."
 
-            md_parts.append(f"\n{para}[^{uid}]\n")
+            para = apply_uid_markers_from_cite_tokens(para, uid)
+
+            md_parts.append(f"\n{para}\n")
 
 
     md_text_so_far = "\n".join(md_parts).strip()
@@ -2912,6 +3042,31 @@ with _field_left:
     )
 
 
+
+
+# -----------------------------
+# Reset plan/routing state when Field changes
+# (prevents UID routing from leaking across fields in Streamlit session_state)
+# -----------------------------
+if "last_selected_field" not in st.session_state:
+    st.session_state["last_selected_field"] = None
+
+if st.session_state["last_selected_field"] != str(selected_field):
+    for _k in [
+        "plan_ready",
+        "plan_text",
+        "plan_counts",
+        "plan_uids",
+        "plan_sections",
+        "plan_section_counts",
+        "sections_confirmed",
+        "uid_routing_preview",
+        "included_sections",
+    ]:
+        if _k in st.session_state:
+            del st.session_state[_k]
+    st.session_state["last_selected_field"] = str(selected_field)
+
 st.divider()
 
 # =============================
@@ -3037,14 +3192,22 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
             # NOTE: This block is inside the main Preflight expander, so it must NOT create another expander.
             st.markdown("**Excluded candidate sections (per UID):**")
             any_excluded = False
+
             for _uid, _meta in uid_routing_preview.items():
                 _ex = _meta.get("excluded_sections") or {}
                 if not _ex:
                     continue
+
                 any_excluded = True
-                st.markdown(f"- **{_uid}** (selected: {_meta.get('selected_section','—')}):")
+
+                # Header line (no bullet prefix)
+                st.markdown(f"**{_uid}** (selected: {_meta.get('selected_section','—')}):")
+
+                # Each excluded section as plain lines (no list syntax)
                 for _sec, _why in _ex.items():
-                    st.markdown(f"  - {_sec}: {_why}")
+                    st.write(f"{_sec}: {_why}")
+
+                st.write("")  # spacing between UIDs
 
             if not any_excluded:
                 st.caption("No excluded candidate sections were recorded for the current UID routing.")
@@ -3112,14 +3275,19 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
 
             st.markdown("**Excluded candidate sections (per UID):**")
             any_excluded = False
+
             for _uid, _meta in _uid_routing_preview.items():
                 _ex = _meta.get("excluded_sections") or {}
                 if not _ex:
                     continue
+
                 any_excluded = True
-                st.markdown(f"- **{_uid}** (selected: {_meta.get('selected_section','—')}):")
+                st.markdown(f"**{_uid}** (selected: {_meta.get('selected_section','—')}):")
+
                 for _sec, _why in _ex.items():
-                    st.markdown(f"  - {_sec}: {_why}")
+                    st.write(f"{_sec}: {_why}")
+
+                st.write("")
 
             if not any_excluded:
                 st.caption("No excluded candidate sections were recorded for the current UID routing.")
