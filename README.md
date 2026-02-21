@@ -31,7 +31,7 @@ The application is designed for regulatory-grade reporting where citation accura
 # 🏗 System Architecture
 
 <p align="center">
-  <img src="docs/images/architecture_diagram.png" width="850"/>
+  <img src="docs/images/architecture.png" width="850"/>
 </p>
 
 ## Pipeline Flow
