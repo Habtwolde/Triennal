@@ -3146,7 +3146,8 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
 
             eff_system_text = build_effective_system_text(system_text_base, style_override)
 
-            with st.spinner("Generating preview (LLM)…"):
+            with st.spinner("Building plan... Please wait."):
+                # 1) LLM plan preview
                 plan_txt = generate_plan(
                     field_value=str(selected_field),
                     uid_list=uids,
@@ -3154,12 +3155,18 @@ with st.expander("Preflight (review preview before generating)", expanded=True):
                     style_override=style_override,
                 )
 
+                # 2) Section inclusion + rationale preview (can also be slow for many UIDs)
+                effective_system_text_preview = build_effective_system_text(system_text_base, style_override)
+                section_to_uids_preview, uid_routing_preview = route_all_uids(
+                    effective_system_text_preview, uid_index_for_plan
+                )
+
+            st.success("Plan successfully built.")
+
             st.subheader("Preview (LLM-generated)")
             st.write(plan_txt)
 
             # --- Section inclusion + rationale preview (requires user confirmation) ---
-            effective_system_text_preview = build_effective_system_text(system_text_base, style_override)
-            section_to_uids_preview, uid_routing_preview = route_all_uids(effective_system_text_preview, uid_index_for_plan)
 
             included_sections = [sec for sec in SECTION_ORDER if section_to_uids_preview.get(sec)]
             section_counts = {sec: len(section_to_uids_preview.get(sec, [])) for sec in included_sections}
@@ -3570,14 +3577,14 @@ if generate:
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
-        if url:
-            full_url = f"{get_workspace_host()}{url}"
-            st.caption(url)
-        else:
-            st.caption("DBFS publish disabled (download using the button above).")
+        # if url:
+        #     full_url = f"{get_workspace_host()}{url}"
+        #     st.caption(url)
+        # else:
+        #     st.caption("DBFS publish disabled (download using the button above).")
 
-        # NOTE: UID routing rationale is intentionally shown during **Build Plan** (preflight),
-        # not after generation. This keeps the post-generation UI focused on download + diagnostics.
+        # # NOTE: UID routing rationale is intentionally shown during **Build Plan** (preflight),
+        # # not after generation. This keeps the post-generation UI focused on download + diagnostics.
     
     except Exception as e:
         progress.progress(1.0, text="Failed.")
